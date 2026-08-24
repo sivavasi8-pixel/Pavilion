@@ -1,0 +1,64 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // The Super Admin PIN is only ever written once, by whoever visits the
+    // Super Admin sign-in screen before anyone else and sets it up — the
+    // app has no "change my Super Admin PIN" feature, so there is no
+    // legitimate reason for this document to ever be overwritten after
+    // that. Locking it to create-only closes off the single biggest hole
+    // in the old rule: anyone rewriting this document effectively took
+    // over the entire platform, since Super Admin can approve/reject any
+    // team, reset any team's admin PIN, and suspend or delete any team.
+    // If a real Super Admin ever forgets this PIN, recovery is a manual
+    // step in the Firebase console (delete this one document), not
+    // something reachable through the app.
+    match /nets_data/superAdminPin {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasAll(['value'])
+                    && request.resource.data.value is string
+                    && request.resource.data.value.size() < 500000;
+      allow update, delete: if false;
+    }
+
+    match /nets_data/{docId} {
+      allow read: if true;
+
+      // Two shapes of writable document:
+      //  1. Platform-level: "teamsIndex" or "pinResetRequests" — never
+      //     team-scoped. ("superAdminPin" used to be allowed here too —
+      //     it now has its own stricter match block above, and is
+      //     deliberately excluded from this list so that block is the
+      //     only thing governing it.)
+      //  2. Team-scoped: "<teamCode>__<key>", where <key> is one of this
+      //     app's known data fields, OR a per-player photo (photo_<id>).
+      //
+      // NOTE: this still has no per-team identity check — anyone who
+      // knows (or guesses) a team code can write to that team's data,
+      // including its adminPin. That's a real, open gap; see the
+      // conversation this file came from for the trade-offs on closing
+      // it further.
+      allow write: if (
+                        docId in ['teamsIndex', 'pinResetRequests']
+                        ||
+                        docId.matches(
+                          '^[a-z0-9-]+__(players|subs|days|pins|payments|adminPin|rates|adjustments|lockedMonths|weekendExceptions|pendingRegistrations|matches|paymentDefault|playerPinResetRequests|adminNotify)$'
+                        )
+                        ||
+                        docId.matches('^[a-z0-9-]+__photo_.*$')
+                      )
+                   && request.resource.data.keys().hasAll(['value'])
+                   && request.resource.data.value is string
+                   && request.resource.data.value.size() < 500000; // ~500KB cap per field
+
+      // Nothing gets deleted through this app, so block it outright.
+      allow delete: if false;
+    }
+
+    // Deny everything else in the database.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

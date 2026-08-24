@@ -1,0 +1,438 @@
+// Pavilion Worker — two jobs living on one Worker:
+//
+// 1. Push-notification relay (POST /) — receives { secret, tokens, title,
+//    body } from index.html, checks the shared secret, sends to Firebase
+//    Cloud Messaging.
+// 2. Tap-to-pay QR card (GET /qr-image, GET /p/:token) — serves a match's
+//    payment QR as a real fetchable image, and a tiny page whose WhatsApp
+//    link-preview thumbnail IS that QR — tapping the resulting card in
+//    WhatsApp (image included) opens the page, which bounces straight
+//    into the UPI app. /p/:token only carries team+matchId — the amount,
+//    UPI id, and payee name are looked up here from Firestore rather than
+//    riding along in the URL, so the link isn't the whole message's worth
+//    of query string when it lands as visible text in WhatsApp.
+//
+// Both use the same service-account credential, which lives ONLY in this
+// Worker's own secret storage — never in the app's client-side code.
+//
+// Required secrets (set via `wrangler secret put <NAME>`, or the
+// Cloudflare dashboard: Workers & Pages → this Worker → Settings →
+// Variables and Secrets):
+//   PUSH_SHARED_SECRET   - must match PUSH_SHARED_SECRET in index.html
+//   FIREBASE_SERVICE_ACCOUNT - the *entire* contents of the service-account
+//                               JSON file downloaded from Firebase Console
+//                               → Project Settings → Service Accounts,
+//                               pasted in as one string.
+
+function base64UrlEncode(input) {
+  let binary;
+  if (typeof input === "string") {
+    binary = input;
+  } else {
+    const bytes = new Uint8Array(input);
+    binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+function pemToArrayBuffer(pem) {
+  const b64 = pem
+    .replace(/-----BEGIN PRIVATE KEY-----/, "")
+    .replace(/-----END PRIVATE KEY-----/, "")
+    .replace(/\s+/g, "");
+  const raw = atob(b64);
+  const bytes = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+  return bytes.buffer;
+}
+
+// Standard Google service-account JWT-bearer flow, using the Workers
+// runtime's built-in Web Crypto — no external JWT library needed. Scopes
+// is a list so the same helper covers both jobs this Worker does — an FCM
+// send only ever needs the messaging scope; reading Firestore for the QR
+// card needs the datastore (read) scope instead.
+async function getAccessToken(serviceAccount, scopes) {
+  const header = { alg: "RS256", typ: "JWT" };
+  const now = Math.floor(Date.now() / 1000);
+  const claims = {
+    iss: serviceAccount.client_email,
+    scope: scopes.join(" "),
+    aud: "https://oauth2.googleapis.com/token",
+    iat: now,
+    exp: now + 3600,
+  };
+  const unsigned = `${base64UrlEncode(JSON.stringify(header))}.${base64UrlEncode(JSON.stringify(claims))}`;
+
+  const key = await crypto.subtle.importKey(
+    "pkcs8",
+    pemToArrayBuffer(serviceAccount.private_key),
+    { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" },
+    false,
+    ["sign"]
+  );
+  const signature = await crypto.subtle.sign(
+    "RSASSA-PKCS1-v1_5",
+    key,
+    new TextEncoder().encode(unsigned)
+  );
+  const jwt = `${unsigned}.${base64UrlEncode(signature)}`;
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: `grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion=${jwt}`,
+  });
+  const data = await res.json();
+  if (!data.access_token) throw new Error("Token exchange failed: " + JSON.stringify(data));
+  return data.access_token;
+}
+
+// The browser calling POST / from index.html is always a cross-origin
+// request (web.app → workers.dev), which means every response — including
+// the automatic OPTIONS preflight the browser sends before the real POST —
+// needs these headers, or the browser blocks the request before it ever
+// reaches the code below. Wildcard origin is fine here: the shared secret
+// already gates actual use, and this endpoint has nothing to read back
+// that would matter if another site could see the response. The QR-card
+// routes below don't need these at all — they're opened as normal
+// navigations/image loads, never fetched cross-origin from JS.
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+function loadServiceAccount(env) {
+  try {
+    return JSON.parse(env.FIREBASE_SERVICE_ACCOUNT);
+  } catch {
+    return null;
+  }
+}
+
+// Reads one nets_data/{docId} document via the Firestore REST API and
+// returns just its `value` string (the same shape window.storage.get
+// already unwraps client-side) — or null if it doesn't exist. Firestore's
+// REST responses wrap every field in a type tag (stringValue, mapValue,
+// ...), unlike the SDK's plain JSON, so this is the one bit of translation
+// needed to read the same documents the app itself writes.
+async function firestoreGetValue(projectId, accessToken, docId) {
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/nets_data/${encodeURIComponent(docId)}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (!res.ok) return null;
+  const doc = await res.json();
+  const val = doc.fields && doc.fields.value && doc.fields.value.stringValue;
+  return val || null;
+}
+
+// Same read as firestoreGetValue, but keeps the HTTP status and error body
+// instead of collapsing every failure to a silent null — used where a
+// missing/forbidden doc needs to say which one it was, rather than being
+// indistinguishable from "the match just isn't in there".
+async function firestoreGetDoc(projectId, accessToken, docId) {
+  const res = await fetch(
+    `https://firestore.googleapis.com/v1/projects/${projectId}/databases/(default)/documents/nets_data/${encodeURIComponent(docId)}`,
+    { headers: { Authorization: `Bearer ${accessToken}` } }
+  );
+  if (res.status === 404) return { found: false, status: 404, value: null, error: null };
+  if (!res.ok) {
+    const errorBody = await res.text().catch(() => "");
+    return { found: false, status: res.status, value: null, error: errorBody.slice(0, 300) };
+  }
+  const doc = await res.json();
+  const val = doc.fields && doc.fields.value && doc.fields.value.stringValue;
+  return { found: true, status: res.status, value: val || null, error: null };
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+}
+
+// Reverse of the encoding index.html's buildPayCardUrl does client-side —
+// plain base64url back to the original "team:matchId" string.
+function base64UrlDecode(str) {
+  const padded = str.replace(/-/g, "+").replace(/_/g, "/").padEnd(str.length + ((4 - (str.length % 4)) % 4), "=");
+  return atob(padded);
+}
+
+// Same rule index.html's computePlayedIds uses to decide who actually
+// played (and so who the fee splits across) — ported here so the Worker
+// can work out the per-player amount itself instead of trusting a number
+// passed in the URL.
+function computePlayedIds(match) {
+  const availableIds = match.available || [];
+  if (match.playedExclusions) {
+    return availableIds.filter((id) => !match.playedExclusions.includes(id));
+  }
+  if (match.played != null) {
+    return availableIds.filter((id) => match.played.includes(id));
+  }
+  return availableIds;
+}
+
+// Serves a match's payment QR as a real image at a real URL — the one
+// thing Firestore's embedded-base64 storage can't offer on its own, and
+// exactly what WhatsApp's link-preview fetcher needs to build a card.
+// Tries the match's own QR override first, then the team's default
+// payment QR — the same fallback order the app's own effectiveQr already
+// uses, so this never shows a different picture than the app does.
+async function handleQrImage(url, env) {
+  const team = url.searchParams.get("team");
+  const matchId = url.searchParams.get("match");
+  if (!team || !matchId) return new Response("Missing team or match", { status: 400 });
+
+  const serviceAccount = loadServiceAccount(env);
+  if (!serviceAccount) return new Response("Server misconfigured", { status: 500 });
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(serviceAccount, ["https://www.googleapis.com/auth/datastore"]);
+  } catch (e) {
+    return new Response("Auth failed: " + e.message, { status: 500 });
+  }
+
+  const projectId = serviceAccount.project_id;
+  let dataUrl = await firestoreGetValue(projectId, accessToken, `${team}__photo_qr_${matchId}`);
+  if (!dataUrl) {
+    const defaultRaw = await firestoreGetValue(projectId, accessToken, `${team}__paymentDefault`);
+    if (defaultRaw) {
+      try {
+        dataUrl = JSON.parse(defaultRaw).qr || null;
+      } catch {
+        dataUrl = null;
+      }
+    }
+  }
+
+  if (!dataUrl || !dataUrl.startsWith("data:")) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  const parsed = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+  if (!parsed) return new Response("Bad image data", { status: 500 });
+  const mime = parsed[1];
+  const binary = atob(parsed[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  return new Response(bytes, {
+    headers: { "Content-Type": mime, "Cache-Control": "public, max-age=3600" },
+  });
+}
+
+// The actual link that goes in the WhatsApp message — /p/<token>, where
+// token is just base64url("team:matchId"). Everything else (amount, UPI
+// id, payee name) is looked up here rather than carried in the URL.
+// WhatsApp's own preview-fetcher only ever reads the <meta> tags below —
+// it doesn't run the redirect script — so it always builds the card
+// correctly regardless of what a real visitor's browser does next.
+async function handlePayCard(url, env, token) {
+  let team = "";
+  let matchId = "";
+  try {
+    const decoded = base64UrlDecode(token);
+    const sep = decoded.indexOf(":");
+    if (sep === -1) throw new Error("bad token");
+    team = decoded.slice(0, sep);
+    matchId = decoded.slice(sep + 1);
+  } catch {
+    return new Response("Bad link", { status: 400 });
+  }
+  if (!team || !matchId) return new Response("Bad link", { status: 400 });
+
+  const serviceAccount = loadServiceAccount(env);
+  if (!serviceAccount) return new Response("Server misconfigured", { status: 500 });
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(serviceAccount, ["https://www.googleapis.com/auth/datastore"]);
+  } catch (e) {
+    return new Response("Auth failed: " + e.message, { status: 500 });
+  }
+
+  const projectId = serviceAccount.project_id;
+  // The matches doc uses the diagnostic reader — everything else stays on
+  // the plain one, since paymentDefault/teamsIndex missing is a normal,
+  // already-handled case ("no default QR set yet"), but "matches" missing
+  // or unreadable is the one failure that otherwise looked identical to
+  // "that match id doesn't exist", which is what made this hard to debug
+  // from the outside.
+  const [matchesDoc, defaultRaw, teamsIndexRaw] = await Promise.all([
+    firestoreGetDoc(projectId, accessToken, `${team}__matches`),
+    firestoreGetValue(projectId, accessToken, `${team}__paymentDefault`),
+    firestoreGetValue(projectId, accessToken, "teamsIndex"),
+  ]);
+
+  if (!matchesDoc.found) {
+    const detail = matchesDoc.status === 404
+      ? `no "matches" record exists for team "${team}"`
+      : `Firestore read failed (HTTP ${matchesDoc.status})${matchesDoc.error ? " — " + matchesDoc.error : ""}`;
+    return new Response(`Could not load match data: ${detail}`, { status: 502 });
+  }
+
+  let matches = {};
+  try {
+    // Stored (and kept in React state) as an object keyed by match id —
+    // { [id]: match } — not an array, same shape index.html's own
+    // matches/setMatches state uses everywhere else.
+    matches = matchesDoc.value ? JSON.parse(matchesDoc.value) : {};
+  } catch (e) {
+    return new Response(`Could not load match data: matches record wasn't valid JSON (${e.message})`, { status: 502 });
+  }
+  const match = matches[matchId] || null;
+  if (!match) {
+    return new Response(`Match not found: team "${team}" has ${Object.keys(matches).length} match(es) on record, none with id "${matchId}"`, { status: 404 });
+  }
+
+  let paymentDefault = {};
+  try {
+    paymentDefault = defaultRaw ? JSON.parse(defaultRaw) : {};
+  } catch {
+    paymentDefault = {};
+  }
+
+  let payeeName = "Pavilion";
+  try {
+    const teamsIndex = teamsIndexRaw ? JSON.parse(teamsIndexRaw) : {};
+    if (teamsIndex[team] && teamsIndex[team].teamName) payeeName = teamsIndex[team].teamName;
+  } catch {
+    // fall through with the default name
+  }
+
+  const upiId = (match.upiNumber || paymentDefault.upiNumber || "").trim();
+  const playedCount = computePlayedIds(match).length;
+  const amount = match.totalCost && playedCount ? Math.round((Number(match.totalCost) / playedCount) * 100) / 100 : 0;
+
+  const imageUrl = `${url.origin}/qr-image?team=${encodeURIComponent(team)}&match=${encodeURIComponent(matchId)}`;
+  const upiParams = new URLSearchParams();
+  if (upiId) upiParams.set("pa", upiId);
+  upiParams.set("pn", payeeName);
+  if (amount) upiParams.set("am", String(amount));
+  upiParams.set("cu", "INR");
+  const upiLink = upiId ? `upi://pay?${upiParams.toString()}` : "";
+  const title = amount ? `Pay ₹${amount} — Match Fee` : "Match Fee Payment";
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="Tap to pay via UPI">
+<meta property="og:image" content="${imageUrl}">
+<meta property="og:type" content="website">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #16301F; color: #F3EEDF; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; text-align: center; }
+  img { width: 160px; height: 160px; border-radius: 12px; background: #fff; margin-bottom: 20px; object-fit: contain; }
+  a.btn { background: #C08A45; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; display: inline-block; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <img src="${imageUrl}" alt="Payment QR" />
+  <div>${escapeHtml(title)}</div>
+  ${upiLink ? `<a class="btn" href="${upiLink}">Tap to pay</a>` : `<div style="margin-top:16px;color:#B7C4B8;font-size:13px;">Scan the QR above to pay</div>`}
+  ${upiLink ? `<script>
+    // A visible fallback button is above regardless — some mobile
+    // browsers only allow a page to redirect after a real tap, so this
+    // automatic attempt isn't guaranteed to fire on every device.
+    setTimeout(function () { window.location.href = ${JSON.stringify(upiLink)}; }, 300);
+  </script>` : ""}
+</body>
+</html>`;
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+async function handlePushSend(request, env) {
+  if (request.method === "OPTIONS") {
+    return new Response(null, { headers: CORS_HEADERS });
+  }
+  if (request.method !== "POST") {
+    return new Response("Method not allowed", { status: 405, headers: CORS_HEADERS });
+  }
+
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return new Response("Bad request", { status: 400, headers: CORS_HEADERS });
+  }
+
+  if (!payload.secret || payload.secret !== env.PUSH_SHARED_SECRET) {
+    return new Response("Forbidden", { status: 403, headers: CORS_HEADERS });
+  }
+
+  // Capped well above any realistic squad size — a sanity limit, not a
+  // real quota control.
+  const tokens = Array.isArray(payload.tokens) ? payload.tokens.filter(Boolean).slice(0, 500) : [];
+  if (tokens.length === 0) {
+    return new Response(JSON.stringify({ ok: true, sent: 0 }), {
+      headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+    });
+  }
+  const title = String(payload.title || "Pavilion").slice(0, 200);
+  const body = String(payload.body || "").slice(0, 500);
+
+  const serviceAccount = loadServiceAccount(env);
+  if (!serviceAccount) {
+    return new Response("Server misconfigured (bad FIREBASE_SERVICE_ACCOUNT secret)", { status: 500, headers: CORS_HEADERS });
+  }
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(serviceAccount, ["https://www.googleapis.com/auth/firebase.messaging"]);
+  } catch (e) {
+    return new Response("Auth to Firebase failed: " + e.message, { status: 500, headers: CORS_HEADERS });
+  }
+
+  const projectId = serviceAccount.project_id;
+  const results = await Promise.allSettled(
+    tokens.map((token) =>
+      fetch(`https://fcm.googleapis.com/v1/projects/${projectId}/messages:send`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          "Content-Type": "application/json",
+        },
+        // `data`, not `notification` — a top-level `notification` field
+        // makes the browser's own push service auto-display a system
+        // notification on its own, in addition to (not instead of) the
+        // one sw.js's onBackgroundMessage/foreground onMessage handler
+        // builds — that's what caused every push to arrive twice.
+        // data-only puts the app in full, single control of what's shown.
+        body: JSON.stringify({
+          message: {
+            token,
+            data: { title, body },
+          },
+        }),
+      })
+    )
+  );
+
+  const sent = results.filter((r) => r.status === "fulfilled" && r.value.ok).length;
+  return new Response(JSON.stringify({ ok: true, sent, total: tokens.length }), {
+    headers: { "Content-Type": "application/json", ...CORS_HEADERS },
+  });
+}
+
+export default {
+  async fetch(request, env) {
+    try {
+      const url = new URL(request.url);
+      if (url.pathname === "/qr-image") return await handleQrImage(url, env);
+      if (url.pathname.startsWith("/p/")) return await handlePayCard(url, env, url.pathname.slice(3));
+      return await handlePushSend(request, env);
+    } catch (e) {
+      // Without this, any uncaught exception anywhere above surfaces to
+      // the visitor as Cloudflare's generic "Error 1101" page, which hides
+      // the actual JS error entirely — useless for tracking down what
+      // broke. This turns it back into a readable message instead.
+      return new Response("Worker error: " + (e && e.stack ? e.stack : String(e)), { status: 500 });
+    }
+  },
+};
