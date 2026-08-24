@@ -551,6 +551,11 @@ function matchBannerKey(matchId) {
 function matchQrKey(matchId) {
   return `qr_${matchId}`;
 }
+// Same pattern again for a Gear Exchange listing's optional photo — its
+// own small photo_ document rather than living inline on the listing.
+function marketplacePhotoKey(id) {
+  return `marketplace_${id}`;
+}
 // WhatsApp messages are read on phones far more than desktops, and a chat
 // bubble is nowhere near wide enough for a padded/aligned "table" (36
 // monospace characters) to fit on one line — it wraps mid-row, right in
@@ -689,6 +694,23 @@ function fmtLiveAgo(iso) {
   if (mins < 60) return `${mins} minutes ago`;
   const hrs = Math.floor(mins / 60);
   return `${hrs} hour${hrs === 1 ? "" : "s"} ago`;
+}
+// Same "time since" idea as fmtLiveAgo, extended out to days/weeks — a
+// live location update is always recent, but a Gear Exchange listing can
+// sit for weeks before it's closed, well past what fmtLiveAgo was ever
+// meant to cover.
+function fmtAgo(iso) {
+  if (!iso) return "";
+  const mins = Math.max(0, Math.floor((Date.now() - new Date(iso).getTime()) / 60000));
+  if (mins < 1) return "just now";
+  if (mins === 1) return "1 minute ago";
+  if (mins < 60) return `${mins} minutes ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs} hour${hrs === 1 ? "" : "s"} ago`;
+  const days = Math.floor(hrs / 24);
+  if (days < 7) return `${days} day${days === 1 ? "" : "s"} ago`;
+  const weeks = Math.floor(days / 7);
+  return `${weeks} week${weeks === 1 ? "" : "s"} ago`;
 }
 // Dropping someone's own carpool entry also has to un-join anyone riding
 // with them, if they were a driver — otherwise a rider is left silently
@@ -843,6 +865,36 @@ function buildCarpoolMessage(match, players, teamName) {
     out.push(`🙋 Still need a ride: ${unmatched.map((p) => p.name).join(", ")}`);
   }
   return out.join("\n").trim();
+}
+// A listing posted by an admin has no player id behind it (admin isn't a
+// player record) — attributed to the team itself instead, the same way a
+// team default payment QR has no single "owner" either.
+function marketplacePosterName(listing, players, teamName) {
+  if (listing.posterId) {
+    const p = players.find((pl) => pl.id === listing.posterId);
+    return p ? p.name : "Former player";
+  }
+  return teamName || "Team";
+}
+function fmtMarketplacePriceRange(min, max) {
+  const a = Number(min) || 0;
+  const b = Number(max) || 0;
+  if (!a && !b) return "";
+  if (a && b && a !== b) return `${fmtINR(a)}–${fmtINR(b)}`;
+  return fmtINR(a || b);
+}
+function buildMarketplaceMessage(listing, players, teamName) {
+  const poster = marketplacePosterName(listing, players, teamName);
+  const out = [];
+  out.push(listing.type === "want" ? `🙋 *Wanted — ${cleanField(listing.category, "Gear")}*` : `🏏 *For Sale — ${cleanField(listing.category, "Gear")}*`);
+  out.push(cleanField(listing.title, "Untitled"));
+  if (listing.description && listing.description.trim()) out.push(listing.description.trim());
+  const priceRange = fmtMarketplacePriceRange(listing.priceMin, listing.priceMax);
+  if (priceRange) out.push(`${listing.type === "want" ? "Budget" : "Asking"}: ${priceRange}`);
+  if (listing.type === "sell" && listing.condition) out.push(`Condition: ${listing.condition}`);
+  out.push("");
+  out.push(`Posted by ${poster} — reply here or reach out directly if interested.`);
+  return out.join("\n");
 }
 // payCardUrl is the Share-only tap-to-pay link (see buildPayCardUrl) — when
 // present it replaces the plain UPI-number line below; the plain-text Copy
@@ -1961,6 +2013,9 @@ function CricketNetsTracker() {
   // once, and all of them should get admin notifications, not just
   // whichever one enabled it most recently.
   const [adminNotify, setAdminNotify] = useState({ fcmTokens: [] });
+  // Object keyed by listing id, same shape as matches — see the Gear
+  // Exchange handlers below (postMarketplaceListing etc.) for how it's written.
+  const [marketplace, setMarketplace] = useState({});
   const [photos, setPhotos] = useState({});
   const [saveError, setSaveError] = useState("");
 
@@ -2091,7 +2146,7 @@ function CricketNetsTracker() {
     }
     window.__activeTeam = activeTeam; // must be set before any storage call below
 
-    const DATA_KEYS = ["players", "subs", "days", "pins", "payments", "adminPin", "rates", "adjustments", "lockedMonths", "weekendExceptions", "pendingRegistrations", "matches", "paymentDefault", "playerPinResetRequests", "adminNotify"];
+    const DATA_KEYS = ["players", "subs", "days", "pins", "payments", "adminPin", "rates", "adjustments", "lockedMonths", "weekendExceptions", "pendingRegistrations", "matches", "paymentDefault", "playerPinResetRequests", "adminNotify", "marketplace"];
     const lastRaw = {};
 
     // Reset to a clean slate so a previous team's data never flashes
@@ -2100,7 +2155,7 @@ function CricketNetsTracker() {
     setAdminPin(null); setRates(DEFAULT_RATES); setAdjustments({}); setLockedMonths({});
     setWeekendExceptions({}); setPendingRegistrations({}); setMatches({}); setPhotos({});
     setPaymentDefault({ upiNumber: "", qr: null }); setPlayerPinResetRequests({});
-    setAdminNotify({ fcmTokens: [] });
+    setAdminNotify({ fcmTokens: [] }); setMarketplace({});
 
     function applyValue(key, raw) {
       if (raw === undefined || raw === null) return;
@@ -2123,6 +2178,7 @@ function CricketNetsTracker() {
         else if (key === "paymentDefault") setPaymentDefault({ upiNumber: "", qr: null, ...parsed });
         else if (key === "playerPinResetRequests") setPlayerPinResetRequests(parsed);
         else if (key === "adminNotify") setAdminNotify({ fcmTokens: [], ...parsed });
+        else if (key === "marketplace") setMarketplace(parsed);
       } catch (e) {
         console.error("Failed to parse", key, e);
       }
@@ -2322,6 +2378,40 @@ function CricketNetsTracker() {
     return () => { cancelled = true; };
   }, [matches, ready]);
 
+  // "Auto-clear" from the Gear Exchange plan — nothing in this app runs on
+  // a schedule, so this works the same lazy way as the migration effect
+  // above: once per load, whichever device happens to open the app first
+  // after a listing's been closed for 4+ weeks quietly removes it (and its
+  // photo, if it had one). Nothing is hidden in the meantime — a closed
+  // listing stays fully visible right up until this fires.
+  const MARKETPLACE_AUTO_CLEAR_DAYS = 28;
+  useEffect(() => {
+    if (!ready) return;
+    const cutoff = Date.now() - MARKETPLACE_AUTO_CLEAR_DAYS * 24 * 60 * 60 * 1000;
+    const expired = Object.values(marketplace).filter(
+      (l) => l.status === "closed" && l.closedAt && new Date(l.closedAt).getTime() < cutoff
+    );
+    if (expired.length === 0) return;
+    let cancelled = false;
+    (async () => {
+      for (const l of expired) {
+        if (l.hasPhoto) await window.storage.delete(`photo_${marketplacePhotoKey(l.id)}`);
+      }
+      if (cancelled) return;
+      setMarketplace((prev) => {
+        const next = { ...prev };
+        expired.forEach((l) => { delete next[l.id]; });
+        return next;
+      });
+      setPhotos((prev) => {
+        const next = { ...prev };
+        expired.forEach((l) => { if (l.hasPhoto) delete next[marketplacePhotoKey(l.id)]; });
+        return next;
+      });
+    })();
+    return () => { cancelled = true; };
+  }, [marketplace, ready]);
+
   // Debounced per key so rapid-fire changes to the SAME field (typing hours,
   // balls, a rate, an adjustment) collapse into one write instead of one
   // write per keystroke — different fields still save independently of each
@@ -2368,6 +2458,7 @@ function CricketNetsTracker() {
   useEffect(() => { if (ready) persist("paymentDefault", paymentDefault); }, [paymentDefault, ready, persist]);
   useEffect(() => { if (ready) persist("playerPinResetRequests", playerPinResetRequests); }, [playerPinResetRequests, ready, persist]);
   useEffect(() => { if (ready) persist("adminNotify", adminNotify); }, [adminNotify, ready, persist]);
+  useEffect(() => { if (ready) persist("marketplace", marketplace); }, [marketplace, ready, persist]);
 
   const monthSubPlayers = subs[activeMonth] || [];
   const monthPayments = payments[activeMonth] || {};
@@ -2633,6 +2724,38 @@ function CricketNetsTracker() {
       tokens: [driver.fcmToken],
       title: "🚘 Seat freed up",
       body: `${rider.name} left your ride for ${cleanField(match.groundName, match.matchType || "the match")}.`,
+    });
+  }
+  // Broadcasts to everyone opted in, riding the same single player
+  // notification toggle as every other push in this app — no separate
+  // Gear-only toggle to manage. Excludes the poster themselves; if an
+  // admin posted it there's no player id to exclude, so it goes to everyone.
+  function notifyNewMarketplaceListing(listing) {
+    const tokens = players.filter((p) => p.id !== listing.posterId).map((p) => p.fcmToken).filter(Boolean);
+    if (tokens.length === 0) return;
+    const poster = marketplacePosterName(listing, players, teamRecord ? teamRecord.teamName : "");
+    sendPushNotification({
+      tokens,
+      title: listing.type === "want" ? "🙋 Gear wanted" : "🏏 Gear for sale",
+      body: `${poster}: ${cleanField(listing.title, "a new gear listing")}.`,
+    });
+  }
+  // Just the poster — a player's own token if a player posted it, or every
+  // admin device's token if the team posted it on its own behalf, same
+  // split notifyAdminNewRegistration/notifyPromoted already draw between
+  // player-owned and admin-owned pushes.
+  function notifyMarketplaceInterest(listing, interestedPlayerId) {
+    const interestedPlayer = players.find((p) => p.id === interestedPlayerId);
+    if (!interestedPlayer) return;
+    const itemLabel = cleanField(listing.title, "your listing");
+    const tokens = listing.posterId
+      ? [(players.find((p) => p.id === listing.posterId) || {}).fcmToken].filter(Boolean)
+      : (adminNotify.fcmTokens || []);
+    if (tokens.length === 0) return;
+    sendPushNotification({
+      tokens,
+      title: "🙋 Someone's interested",
+      body: `${interestedPlayer.name} is interested in "${itemLabel}".`,
     });
   }
   // Reuses exactly who's already pending — no separate "who gets notified"
@@ -3632,6 +3755,71 @@ function CricketNetsTracker() {
     setMatches((prev) => { const next = { ...prev }; delete next[matchId]; return next; });
   }
 
+  // posterId is null when the admin posts on the team's own behalf (e.g.
+  // selling old club kit) — there's no player record to attribute it to.
+  function postMarketplaceListing(fields, posterId) {
+    const id = `mkt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const listing = {
+      id,
+      type: fields.type === "want" ? "want" : "sell",
+      category: fields.category || "Other",
+      title: (fields.title || "").trim(),
+      description: (fields.description || "").trim(),
+      condition: fields.type === "sell" ? (fields.condition || "") : "",
+      priceMin: fields.priceMin || "",
+      priceMax: fields.priceMax || "",
+      posterId: posterId || null,
+      postedAt: new Date().toISOString(),
+      status: "active",
+      closedAt: null,
+      interested: [],
+      hasPhoto: !!fields.photoDataUrl,
+    };
+    setMarketplace((prev) => ({ ...prev, [id]: listing }));
+    if (fields.photoDataUrl) {
+      const photoKey = marketplacePhotoKey(id);
+      window.storage.set(`photo_${photoKey}`, fields.photoDataUrl).then((res) => {
+        if (res) setPhotos((prev) => ({ ...prev, [photoKey]: fields.photoDataUrl }));
+      });
+    }
+    notifyNewMarketplaceListing(listing);
+    return id;
+  }
+  // Closing (not deleting) is what the poster does themselves once it's
+  // sold/found — see the auto-clear effect below for what eventually
+  // removes it outright.
+  function closeMarketplaceListing(id) {
+    setMarketplace((prev) => {
+      if (!prev[id]) return prev;
+      return { ...prev, [id]: { ...prev[id], status: "closed", closedAt: new Date().toISOString() } };
+    });
+  }
+  // Admin-only in the UI (moderation) — removes the listing and its photo
+  // outright, unlike closeMarketplaceListing above.
+  async function deleteMarketplaceListing(id) {
+    const listing = marketplace[id];
+    setMarketplace((prev) => { const next = { ...prev }; delete next[id]; return next; });
+    if (listing && listing.hasPhoto) {
+      const photoKey = marketplacePhotoKey(id);
+      await window.storage.delete(`photo_${photoKey}`);
+      setPhotos((prev) => { const next = { ...prev }; delete next[photoKey]; return next; });
+    }
+  }
+  function toggleMarketplaceInterest(id, playerId) {
+    let becameInterested = false;
+    setMarketplace((prev) => {
+      const listing = prev[id];
+      if (!listing) return prev;
+      const already = (listing.interested || []).includes(playerId);
+      const nextInterested = already
+        ? listing.interested.filter((pid) => pid !== playerId)
+        : [...(listing.interested || []), playerId];
+      becameInterested = !already;
+      return { ...prev, [id]: { ...listing, interested: nextInterested } };
+    });
+    if (becameInterested && marketplace[id]) notifyMarketplaceInterest(marketplace[id], playerId);
+  }
+
   function buildDashboardMessage() {
     return [
       `🏏 *${monthLabel(activeMonth)} Nets Update*`,
@@ -3804,6 +3992,10 @@ function CricketNetsTracker() {
           initialSelectedId={pendingAutoPlayer && pendingAutoPlayer.teamCode === activeTeam ? pendingAutoPlayer.playerId : null}
           rememberProfile={(playerId, playerName) => rememberProfile({ teamCode: activeTeam, teamName: teamRecord ? teamRecord.teamName : "", playerId, playerName })}
           submitPlayerPinResetRequest={submitPlayerPinResetRequest}
+          marketplace={marketplace}
+          postMarketplaceListing={postMarketplaceListing}
+          toggleMarketplaceInterest={toggleMarketplaceInterest}
+          closeMarketplaceListing={closeMarketplaceListing}
         />
       )}
 
@@ -3946,6 +4138,18 @@ function CricketNetsTracker() {
                 teamName={teamRecord ? teamRecord.teamName : ""}
               />
             )}
+            {tab === "gear" && (
+              <MarketplaceTab
+                marketplace={marketplace} photos={photos} players={players}
+                isAdmin={true} viewerId={null}
+                teamName={teamRecord ? teamRecord.teamName : ""}
+                onPost={(fields) => postMarketplaceListing(fields, null)}
+                onToggleInterest={() => {}}
+                onClose={closeMarketplaceListing}
+                onDelete={deleteMarketplaceListing}
+                onViewPhoto={openTopLevelPhoto}
+              />
+            )}
           </div>
 
           <BottomNav tab={tab} setTab={setTab} />
@@ -3968,7 +4172,7 @@ function BottomNav({ tab, setTab }) {
     { key: "players", icon: "👥", label: "Players" },
     { key: "stats", icon: "📊", label: "Stats" },
   ];
-  const moreActive = tab === "summary" || tab === "settings" || tab === "matches";
+  const moreActive = tab === "summary" || tab === "settings" || tab === "matches" || tab === "gear";
   return (
     <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, display: "flex", justifyContent: "center", zIndex: 50 }}>
       <div className="w-760" style={{ width: "100%", position: "relative" }}>
@@ -3979,6 +4183,9 @@ function BottomNav({ tab, setTab }) {
             </button>
             <button onClick={() => { setTab("matches"); setShowMore(false); }} style={{ width: "100%", textAlign: "left", background: tab === "matches" ? "rgba(255,255,255,0.08)" : "transparent", border: "none", color: COLORS.cream, padding: "12px 16px", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
               <Icon size={15}>🏏</Icon> Matches
+            </button>
+            <button onClick={() => { setTab("gear"); setShowMore(false); }} style={{ width: "100%", textAlign: "left", background: tab === "gear" ? "rgba(255,255,255,0.08)" : "transparent", border: "none", color: COLORS.cream, padding: "12px 16px", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
+              <Icon size={15}>🛒</Icon> Gear
             </button>
             <button onClick={() => { setTab("settings"); setShowMore(false); }} style={{ width: "100%", textAlign: "left", background: tab === "settings" ? "rgba(255,255,255,0.08)" : "transparent", border: "none", color: COLORS.cream, padding: "12px 16px", fontSize: 13, cursor: "pointer", display: "flex", alignItems: "center", gap: 8 }}>
               <Icon size={15}>⚙</Icon> Settings
@@ -5006,7 +5213,7 @@ function HighlightClipCard({ player, setPlayerVideo, removePlayerVideo, onView }
   );
 }
 
-function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, rememberProfile, submitPlayerPinResetRequest }) {
+function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing }) {
   const [selectedId, setSelectedId] = useState(() => (
     initialSelectedId && players.some((p) => p.id === initialSelectedId) ? initialSelectedId : ""
   ));
@@ -5354,6 +5561,18 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
               teamName={teamRecord ? teamRecord.teamName : ""}
             />
           )}
+          {playerTab === "gear" && (
+            <MarketplaceTab
+              marketplace={marketplace} photos={photos} players={players}
+              isAdmin={false} viewerId={authedPlayer.id}
+              teamName={teamRecord ? teamRecord.teamName : ""}
+              onPost={(fields) => postMarketplaceListing(fields, authedPlayer.id)}
+              onToggleInterest={toggleMarketplaceInterest}
+              onClose={closeMarketplaceListing}
+              onDelete={() => {}}
+              onViewPhoto={openPhoto}
+            />
+          )}
         </div>
 
         <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, display: "flex", justifyContent: "center", zIndex: 50 }}>
@@ -5370,6 +5589,10 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
               <button onClick={() => setPlayerTab("matches")} style={{ background: "transparent", border: "none", cursor: "pointer", textAlign: "center", color: playerTab === "matches" ? COLORS.cream : "#7C8E80", padding: "4px 8px" }}>
                 <div><Icon size={18}>🏏</Icon></div>
                 <div style={{ fontSize: 9, marginTop: 2 }}>Matches</div>
+              </button>
+              <button onClick={() => setPlayerTab("gear")} style={{ background: "transparent", border: "none", cursor: "pointer", textAlign: "center", color: playerTab === "gear" ? COLORS.cream : "#7C8E80", padding: "4px 8px" }}>
+                <div><Icon size={18}>🛒</Icon></div>
+                <div style={{ fontSize: 9, marginTop: 2 }}>Gear</div>
               </button>
             </div>
           </div>
@@ -7406,6 +7629,9 @@ const OVERS_OPTIONS = ["10", "15", "20", "30", "50"];
 const BALL_TYPE_OPTIONS = ["Leather Red", "Leather White"];
 const JERSEY_OPTIONS = ["Whites", "Color"];
 const SEAT_COUNT_OPTIONS = ["1", "2", "3", "4", "5", "6", "7", "8"];
+const GEAR_CATEGORIES = ["Bat", "Pads", "Gloves", "Helmet", "Shoes", "Kit Bag", "Ball", "Other"];
+const GEAR_CATEGORY_ICON = { Bat: "🏏", Pads: "🦵", Gloves: "🧤", Helmet: "⛑️", Shoes: "👟", "Kit Bag": "🎒", Ball: "⚪", Other: "📦" };
+const EMPTY_LISTING_FORM = { type: "sell", category: "", title: "", description: "", condition: "", priceMin: "", priceMax: "", photoDataUrl: null };
 
 // A plain <select> with a blank first option, so the field stays optional
 // exactly like the free-text input it replaces — nothing downstream reads
@@ -7553,6 +7779,245 @@ function DobField({ value, onChange, onBlur, maxDate, dark, compact }) {
       <button type="button" onClick={enterManual} style={linkStyle}>
         Type it instead
       </button>
+    </div>
+  );
+}
+
+// The Gear Exchange tab — one feed, two post types (Sell/Want), shared
+// between the admin and player sides via `isAdmin` rather than two
+// separate near-identical components, since the feed itself is the same
+// either way and only a couple of per-card actions actually differ.
+function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamName, onPost, onToggleInterest, onClose, onDelete, onViewPhoto }) {
+  const [filter, setFilter] = useState("all"); // all | sell | want | mine
+  const [showForm, setShowForm] = useState(false);
+  const [form, setForm] = useState(EMPTY_LISTING_FORM);
+  const [formError, setFormError] = useState("");
+  const [posting, setPosting] = useState(false);
+  const [expandedId, setExpandedId] = useState(null);
+
+  const allListings = Object.values(marketplace || {}).sort((a, b) => (b.postedAt || "").localeCompare(a.postedAt || ""));
+  const listings = allListings.filter((l) => {
+    const mine = isAdmin ? l.posterId === null : l.posterId === viewerId;
+    if (filter === "mine") return mine;
+    if (l.status !== "active") return false; // closed listings only ever show under "Mine"
+    if (filter === "sell") return l.type === "sell";
+    if (filter === "want") return l.type === "want";
+    return true;
+  });
+
+  function updateForm(field, value) {
+    setForm((prev) => ({ ...prev, [field]: value }));
+  }
+  async function handleSubmit() {
+    setFormError("");
+    if (!form.title.trim()) { setFormError("Give it a short title."); return; }
+    if (!form.category) { setFormError("Pick a category."); return; }
+    setPosting(true);
+    await onPost(form);
+    setPosting(false);
+    setForm(EMPTY_LISTING_FORM);
+    setShowForm(false);
+  }
+
+  const FILTERS = [["all", "All"], ["sell", "For Sale"], ["want", "Wanted"], ["mine", "Mine"]];
+
+  return (
+    <div>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 }}>
+        <div style={{ fontSize: 12.5, color: COLORS.inkSoft }}>Buy, sell, or ask around for cricket gear.</div>
+        <button onClick={() => setShowForm((v) => !v)} style={{ flexShrink: 0, background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+          {showForm ? "Cancel" : "+ Post"}
+        </button>
+      </div>
+
+      {showForm && (
+        <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
+            <button
+              onClick={() => updateForm("type", "sell")} className="chip"
+              style={{ flex: 1, cursor: "pointer", borderRadius: 10, padding: "10px", fontSize: 13, fontWeight: 600, border: `1px solid ${form.type === "sell" ? COLORS.willow : COLORS.line}`, background: form.type === "sell" ? COLORS.willow : "transparent", color: form.type === "sell" ? "#fff" : COLORS.ink }}
+            >
+              🏏 Selling
+            </button>
+            <button
+              onClick={() => updateForm("type", "want")} className="chip"
+              style={{ flex: 1, cursor: "pointer", borderRadius: 10, padding: "10px", fontSize: 13, fontWeight: 600, border: `1px solid ${form.type === "want" ? COLORS.willow : COLORS.line}`, background: form.type === "want" ? COLORS.willow : "transparent", color: form.type === "want" ? "#fff" : COLORS.ink }}
+            >
+              🙋 Wanted
+            </button>
+          </div>
+          <FieldSelect placeholder="Category" value={form.category} onChange={(v) => updateForm("category", v)} options={GEAR_CATEGORIES} style={{ ...inputStyle, marginBottom: 8 }} />
+          <input placeholder="Title — e.g. SG Bat, English Willow" value={form.title} onChange={(e) => updateForm("title", e.target.value)} onBlur={(e) => updateForm("title", e.target.value.trim())} style={{ ...inputStyle, marginBottom: 8 }} />
+          <textarea
+            placeholder="Details (optional)" value={form.description} onChange={(e) => updateForm("description", e.target.value)}
+            style={{ ...inputStyle, marginBottom: 8, minHeight: 60, resize: "vertical", fontFamily: "inherit" }}
+          />
+          {form.type === "sell" && (
+            <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+              <button
+                onClick={() => updateForm("condition", "New")} className="chip"
+                style={{ flex: 1, cursor: "pointer", borderRadius: 8, padding: "8px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${form.condition === "New" ? COLORS.willow : COLORS.line}`, background: form.condition === "New" ? "#E4C79A" : "transparent", color: COLORS.ink }}
+              >
+                New
+              </button>
+              <button
+                onClick={() => updateForm("condition", "Used")} className="chip"
+                style={{ flex: 1, cursor: "pointer", borderRadius: 8, padding: "8px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${form.condition === "Used" ? COLORS.willow : COLORS.line}`, background: form.condition === "Used" ? "#E4C79A" : "transparent", color: COLORS.ink }}
+              >
+                Used
+              </button>
+            </div>
+          )}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+            <input
+              placeholder={form.type === "want" ? "Budget min" : "Price min"} inputMode="decimal" value={form.priceMin}
+              onChange={(e) => updateForm("priceMin", sanitizeDecimalInput(e.target.value))} style={inputStyle}
+            />
+            <input
+              placeholder={form.type === "want" ? "Budget max" : "Price max"} inputMode="decimal" value={form.priceMax}
+              onChange={(e) => updateForm("priceMax", sanitizeDecimalInput(e.target.value))} style={inputStyle}
+            />
+          </div>
+          <PlainImageUpload maxDim={800} quality={0.78} onUpload={(dataUrl) => updateForm("photoDataUrl", dataUrl)}>
+            {(busy) => (
+              <div style={{ border: `1.5px dashed ${COLORS.line}`, borderRadius: 10, padding: 12, textAlign: "center", cursor: "pointer", background: "#fff", marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
+                {form.photoDataUrl && <img src={form.photoDataUrl} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 8 }} />}
+                <div style={{ fontSize: 11.5, color: COLORS.inkSoft }}>{busy ? "Uploading…" : form.photoDataUrl ? "Tap to replace photo" : "+ Add a photo (optional)"}</div>
+              </div>
+            )}
+          </PlainImageUpload>
+          {formError && <div style={{ background: "#FCEBEA", color: COLORS.leather, borderRadius: 8, padding: "8px 12px", fontSize: 11.5, marginBottom: 8 }}>{formError}</div>}
+          <button onClick={handleSubmit} disabled={posting} style={{ width: "100%", background: COLORS.pitch, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 13, fontWeight: 600, cursor: posting ? "default" : "pointer", opacity: posting ? 0.7 : 1 }}>
+            {posting ? "Posting…" : "Post"}
+          </button>
+        </div>
+      )}
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
+        {FILTERS.map(([key, label]) => (
+          <button
+            key={key} onClick={() => setFilter(key)}
+            style={{ fontSize: 11.5, fontWeight: 600, padding: "6px 13px", borderRadius: 20, border: "none", cursor: "pointer", background: filter === key ? COLORS.willow : "#EEEAD9", color: filter === key ? "#fff" : COLORS.inkSoft }}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+
+      {listings.length === 0 ? (
+        <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 24, textAlign: "center" }}>
+          <div style={{ fontSize: 28, marginBottom: 8 }}>🏏</div>
+          <div style={{ fontSize: 13, color: COLORS.inkSoft }}>{filter === "mine" ? "You haven't posted anything yet." : "Nothing posted yet — be the first."}</div>
+        </div>
+      ) : (
+        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+          {listings.map((l) => (
+            <MarketplaceListingCard
+              key={l.id} listing={l} photo={photos[marketplacePhotoKey(l.id)]} players={players} photos={photos} teamName={teamName}
+              isAdmin={isAdmin} viewerId={viewerId} expanded={expandedId === l.id} onToggleExpand={() => setExpandedId(expandedId === l.id ? null : l.id)}
+              onToggleInterest={onToggleInterest} onClose={onClose} onDelete={onDelete} onViewPhoto={onViewPhoto}
+            />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MarketplaceListingCard({ listing, photo, players, photos, teamName, isAdmin, viewerId, expanded, onToggleExpand, onToggleInterest, onClose, onDelete, onViewPhoto }) {
+  const [copied, setCopied] = useState(false);
+  const posterName = marketplacePosterName(listing, players, teamName);
+  const priceRange = fmtMarketplacePriceRange(listing.priceMin, listing.priceMax);
+  const isMine = isAdmin ? listing.posterId === null : listing.posterId === viewerId;
+  const iAmInterested = !isAdmin && (listing.interested || []).includes(viewerId);
+  const interestedPlayers = (listing.interested || []).map((id) => players.find((p) => p.id === id)).filter(Boolean);
+
+  async function handleCopy() {
+    const ok = await copyText(buildMarketplaceMessage(listing, players, teamName));
+    setCopied(ok);
+    if (ok) setTimeout(() => setCopied(false), 2000);
+  }
+
+  return (
+    <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, overflow: "hidden", opacity: listing.status === "closed" ? 0.65 : 1 }}>
+      <button onClick={onToggleExpand} style={{ width: "100%", textAlign: "left", background: "transparent", border: "none", cursor: "pointer", padding: 14, display: "flex", gap: 10 }}>
+        <div style={{ width: 44, height: 44, borderRadius: 8, overflow: "hidden", flexShrink: 0, background: "#E4C79A", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>
+          {photo ? <img src={photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : (GEAR_CATEGORY_ICON[listing.category] || "📦")}
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+            <span style={{ fontSize: 13.5, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{listing.title}</span>
+            {priceRange && <span className="mono" style={{ fontSize: 12, fontWeight: 700, color: "#3B7A3E", flexShrink: 0 }}>{priceRange}</span>}
+          </div>
+          <div style={{ fontSize: 11, color: COLORS.inkSoft, marginTop: 2 }}>{posterName} · {fmtAgo(listing.postedAt)}</div>
+          <div style={{ display: "flex", gap: 5, marginTop: 6, flexWrap: "wrap" }}>
+            <span style={{ fontSize: 9.5, fontWeight: 700, padding: "2px 8px", borderRadius: 20, textTransform: "uppercase", background: listing.type === "want" ? "#F6E9D2" : "#EAF3E4", color: listing.type === "want" ? "#8A5A17" : "#3B6D11" }}>
+              {listing.type === "want" ? "Wanted" : "For sale"}
+            </span>
+            {listing.condition && <span style={{ fontSize: 9.5, fontWeight: 700, padding: "2px 8px", borderRadius: 20, textTransform: "uppercase", background: "#EEEAD9", color: COLORS.inkSoft }}>{listing.condition}</span>}
+            {listing.status === "closed" && <span style={{ fontSize: 9.5, fontWeight: 700, padding: "2px 8px", borderRadius: 20, textTransform: "uppercase", background: "#F5E1DC", color: "#9A3634" }}>Closed</span>}
+          </div>
+        </div>
+      </button>
+
+      {expanded && (
+        <div style={{ padding: "0 14px 14px" }}>
+          {listing.description && <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 10, whiteSpace: "pre-wrap" }}>{listing.description}</div>}
+          {photo && (
+            <img
+              src={photo} alt={listing.title} onClick={() => onViewPhoto(listing.title, photo, true)}
+              style={{ width: "100%", maxHeight: 200, objectFit: "cover", borderRadius: 10, marginBottom: 10, cursor: "pointer" }}
+            />
+          )}
+
+          {interestedPlayers.length > 0 && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.inkSoft, marginBottom: 6 }}>🙋 Interested ({interestedPlayers.length})</div>
+              <AvatarStack people={interestedPlayers} currentPlayerId={viewerId} photos={photos} onViewPhoto={onViewPhoto} />
+            </div>
+          )}
+
+          <div style={{ display: "flex", gap: 8, marginBottom: 8 }}>
+            <button onClick={handleCopy} style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "8px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+              {copied ? "✅ Copied!" : "📋 Copy"}
+            </button>
+            <WhatsAppShareLink text={buildMarketplaceMessage(listing, players, teamName)} style={{ flex: 1, padding: "8px" }}>
+              💬 Share
+            </WhatsAppShareLink>
+          </div>
+
+          {!isAdmin && listing.status === "active" && !isMine && (
+            <button
+              onClick={() => onToggleInterest(listing.id, viewerId)}
+              style={{
+                width: "100%", cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600,
+                border: `1px solid ${iAmInterested ? "#3B7A3E" : COLORS.willow}`,
+                background: iAmInterested ? "#3B7A3E" : "transparent", color: iAmInterested ? "#fff" : COLORS.willow,
+              }}
+            >
+              {iAmInterested ? "✓ You're interested" : "🙋 I'm interested"}
+            </button>
+          )}
+
+          {isMine && listing.status === "active" && (
+            <button
+              onClick={() => onClose(listing.id)}
+              style={{ width: "100%", marginTop: 8, cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.inkSoft }}
+            >
+              Mark as {listing.type === "want" ? "Found" : "Sold"}
+            </button>
+          )}
+
+          {isAdmin && (
+            <button
+              onClick={() => onDelete(listing.id)}
+              style={{ width: "100%", marginTop: 8, cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${COLORS.leather}`, background: "transparent", color: COLORS.leather }}
+            >
+              Delete listing
+            </button>
+          )}
+        </div>
+      )}
     </div>
   );
 }
