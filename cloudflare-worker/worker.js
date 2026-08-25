@@ -1,4 +1,4 @@
-// Pavilion Worker — two jobs living on one Worker:
+// Pavilion Worker — three jobs living on one Worker:
 //
 // 1. Push-notification relay (POST /) — receives { secret, tokens, title,
 //    body } from index.html, checks the shared secret, sends to Firebase
@@ -11,9 +11,18 @@
 //    UPI id, and payee name are looked up here from Firestore rather than
 //    riding along in the URL, so the link isn't the whole message's worth
 //    of query string when it lands as visible text in WhatsApp.
+// 3. Live video broker (POST /live/start, /live/join, /live/end) — a thin,
+//    authenticated relay between the browser and Cloudflare RealtimeKit's
+//    own REST API. The browser never sees the RealtimeKit API key; it only
+//    ever talks to this Worker, which holds that key and makes the real
+//    calls on its behalf — the same "Worker holds the secret, the app
+//    never does" shape as the other two jobs above. Every /live/* route is
+//    gated by the same PUSH_SHARED_SECRET already baked into index.html,
+//    so a stranger who finds this Worker's URL can't spend the team's free
+//    RealtimeKit quota.
 //
-// Both use the same service-account credential, which lives ONLY in this
-// Worker's own secret storage — never in the app's client-side code.
+// All three share the same kind of setup: real credentials live ONLY in
+// this Worker's own secret storage, never in the app's client-side code.
 //
 // Required secrets (set via `wrangler secret put <NAME>`, or the
 // Cloudflare dashboard: Workers & Pages → this Worker → Settings →
@@ -23,6 +32,28 @@
 //                               JSON file downloaded from Firebase Console
 //                               → Project Settings → Service Accounts,
 //                               pasted in as one string.
+//   REALTIMEKIT_ACCOUNT_ID - your Cloudflare account ID (shown on almost
+//                             every page of the Cloudflare dashboard).
+//   REALTIMEKIT_APP_ID     - the RealtimeKit app's own id (from its page
+//                             under Media → Realtime → RealtimeKit).
+//   REALTIMEKIT_API_TOKEN  - a Cloudflare API Token (dashboard → My
+//                             Profile → API Tokens → Create Token),
+//                             scoped to the "Realtime Admin" permission.
+//   REALTIMEKIT_HOST_PRESET   - optional; defaults to "group_call_host" if
+//                                unset. Only needs setting if your account's
+//                                preset is named differently. (Not
+//                                "livestream_host" — RealtimeKit's
+//                                Interactive Livestream feature calls a
+//                                retired legacy API domain internally as of
+//                                writing and 404s for every viewer, so this
+//                                app uses a plain WebRTC meeting preset
+//                                instead. Cloudflare's SFU still forwards
+//                                video server-side under this preset too —
+//                                one broadcaster upload regardless of
+//                                viewer count — so nothing about the actual
+//                                scaling story changes.)
+//   REALTIMEKIT_VIEWER_PRESET - optional; defaults to "group_call_participant"
+//                                if unset, same idea as the host preset.
 
 function base64UrlEncode(input) {
   let binary;
@@ -420,12 +451,153 @@ async function handlePushSend(request, env) {
   });
 }
 
+// ---- Live video (Cloudflare RealtimeKit) ----
+// https://api.cloudflare.com/client/v4/accounts/{accountId}/realtime/kit/
+// {appId}/... — Cloudflare's current, unified API for RealtimeKit,
+// Bearer-token authenticated with a real Cloudflare API Token (scoped to
+// the "Realtime Admin" permission), entirely separate from the
+// Firebase/Google credential used above. This replaces an earlier,
+// now-retired standalone RealtimeKit API (Org ID + API key, Basic auth) —
+// Cloudflare shut that one down mid-build, hence the Bearer-token shape
+// here rather than Basic. RealtimeKit is a meeting layer built on top of
+// Cloudflare's own Realtime SFU: creating a "meeting" and adding
+// participants under a preset (host vs. viewer) is what raw SFU sessions
+// and hand-built publish/pull track logic used to require us to do
+// ourselves — the preset system does that instead.
+function rtkBase(env) {
+  return `https://api.cloudflare.com/client/v4/accounts/${env.REALTIMEKIT_ACCOUNT_ID}/realtime/kit/${env.REALTIMEKIT_APP_ID}`;
+}
+
+async function rtkFetch(env, method, path, body) {
+  const res = await fetch(`${rtkBase(env)}${path}`, {
+    method,
+    headers: {
+      Authorization: `Bearer ${env.REALTIMEKIT_API_TOKEN}`,
+      "Content-Type": "application/json",
+    },
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  return { ok: res.ok, status: res.status, data };
+}
+
+// RealtimeKit wraps every response as { success, result/data: {...} } —
+// this pulls the actual object out regardless of which key a given
+// endpoint uses, or whether it also happens to echo fields at the top
+// level.
+function rtkData(res) {
+  return (res.data && (res.data.result || res.data.data)) || res.data || {};
+}
+
+// Shared front door for every /live/* route: handles the OPTIONS
+// preflight, requires POST, parses the JSON body, and checks the same
+// shared secret every other route already checks.
+async function readLiveRequest(request, env) {
+  if (request.method === "OPTIONS") return { preflight: true };
+  if (request.method !== "POST") {
+    return { error: new Response("Method not allowed", { status: 405, headers: CORS_HEADERS }) };
+  }
+  let payload;
+  try {
+    payload = await request.json();
+  } catch {
+    return { error: new Response("Bad request", { status: 400, headers: CORS_HEADERS }) };
+  }
+  if (!payload.secret || payload.secret !== env.PUSH_SHARED_SECRET) {
+    return { error: new Response("Forbidden", { status: 403, headers: CORS_HEADERS }) };
+  }
+  if (!env.REALTIMEKIT_ACCOUNT_ID || !env.REALTIMEKIT_APP_ID || !env.REALTIMEKIT_API_TOKEN) {
+    return { error: new Response("Server misconfigured (missing REALTIMEKIT_ACCOUNT_ID/REALTIMEKIT_APP_ID/REALTIMEKIT_API_TOKEN)", { status: 500, headers: CORS_HEADERS }) };
+  }
+  return { payload };
+}
+
+// The broadcaster's side — opens a fresh RealtimeKit meeting for this
+// match, then adds the broadcaster into it under the host preset (full
+// publish rights). Returns the meeting id (goes in Firestore, so every
+// viewer's device can find it) and the broadcaster's own auth token (goes
+// straight into the client SDK, never touches Firestore).
+async function handleLiveStart(request, env) {
+  const { preflight, error, payload } = await readLiveRequest(request, env);
+  if (preflight) return new Response(null, { headers: CORS_HEADERS });
+  if (error) return error;
+  const { matchLabel, broadcasterId, broadcasterName } = payload;
+
+  const meetingRes = await rtkFetch(env, "POST", "/meetings", {
+    title: String(matchLabel || "Pavilion Live").slice(0, 100),
+    record_on_start: false,
+  });
+  const meetingId = rtkData(meetingRes).id;
+  if (!meetingRes.ok || !meetingId) {
+    return new Response(`Could not start a live meeting: ${JSON.stringify(meetingRes.data)}`, { status: 502, headers: CORS_HEADERS });
+  }
+
+  const hostPreset = env.REALTIMEKIT_HOST_PRESET || "group_call_host";
+  const participantRes = await rtkFetch(env, "POST", `/meetings/${meetingId}/participants`, {
+    name: String(broadcasterName || "Broadcaster").slice(0, 60),
+    preset_name: hostPreset,
+    custom_participant_id: String(broadcasterId || crypto.randomUUID()),
+  });
+  const token = rtkData(participantRes).token;
+  if (!participantRes.ok || !token) {
+    return new Response(`Could not join as host: ${JSON.stringify(participantRes.data)}`, { status: 502, headers: CORS_HEADERS });
+  }
+
+  return new Response(JSON.stringify({ meetingId, authToken: token }), { headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
+}
+
+// A viewer's side — adds them into the broadcaster's already-open meeting
+// under the viewer preset (watch-only by default, can't accidentally
+// publish their own camera/mic).
+async function handleLiveJoin(request, env) {
+  const { preflight, error, payload } = await readLiveRequest(request, env);
+  if (preflight) return new Response(null, { headers: CORS_HEADERS });
+  if (error) return error;
+  const { meetingId, viewerId, viewerName } = payload;
+  if (!meetingId) {
+    return new Response("Missing meetingId", { status: 400, headers: CORS_HEADERS });
+  }
+
+  const viewerPreset = env.REALTIMEKIT_VIEWER_PRESET || "group_call_participant";
+  const participantRes = await rtkFetch(env, "POST", `/meetings/${meetingId}/participants`, {
+    name: String(viewerName || "Viewer").slice(0, 60),
+    preset_name: viewerPreset,
+    custom_participant_id: String(viewerId || crypto.randomUUID()),
+  });
+  const token = rtkData(participantRes).token;
+  if (!participantRes.ok || !token) {
+    return new Response(`Could not join as viewer: ${JSON.stringify(participantRes.data)}`, { status: 502, headers: CORS_HEADERS });
+  }
+
+  return new Response(JSON.stringify({ authToken: token }), { headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
+}
+
+// Called when the broadcaster taps "End broadcast" — best-effort; the
+// browser leaves the meeting on its own regardless, and Firestore's own
+// liveMeetingId being cleared is what actually drives every viewer's UI
+// back to normal. This just also tells RealtimeKit the meeting is done, so
+// a stale meeting id can't be rejoined later.
+async function handleLiveEnd(request, env) {
+  const { preflight, error, payload } = await readLiveRequest(request, env);
+  if (preflight) return new Response(null, { headers: CORS_HEADERS });
+  if (error) return error;
+  const { meetingId } = payload;
+  if (!meetingId) {
+    return new Response("Missing meetingId", { status: 400, headers: CORS_HEADERS });
+  }
+  const res = await rtkFetch(env, "PATCH", `/meetings/${meetingId}`, { status: "INACTIVE" });
+  return new Response(JSON.stringify({ ok: true, deactivated: res.ok }), { headers: { "Content-Type": "application/json", ...CORS_HEADERS } });
+}
+
 export default {
   async fetch(request, env) {
     try {
       const url = new URL(request.url);
       if (url.pathname === "/qr-image") return await handleQrImage(url, env);
       if (url.pathname.startsWith("/p/")) return await handlePayCard(url, env, url.pathname.slice(3));
+      if (url.pathname === "/live/start") return await handleLiveStart(request, env);
+      if (url.pathname === "/live/join") return await handleLiveJoin(request, env);
+      if (url.pathname === "/live/end") return await handleLiveEnd(request, env);
       return await handlePushSend(request, env);
     } catch (e) {
       // Without this, any uncaught exception anywhere above surfaces to

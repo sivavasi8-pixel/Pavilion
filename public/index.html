@@ -17,6 +17,11 @@
 <script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
 
+<!-- Live match video: Cloudflare RealtimeKit's browser SDK, plain script
+     tag build — no npm/build step needed, matches how every other library
+     in this app is loaded. Exposes a global RealtimeKitClient. -->
+<script src="https://cdn.jsdelivr.net/npm/@cloudflare/realtimekit@latest/dist/browser.js"></script>
+
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging-compat.js"></script>
@@ -78,6 +83,23 @@
     } catch (e) {
       console.error("push send failed", e);
     }
+  }
+  // Same Worker, same shared secret, but for the /live/* routes that broker
+  // Cloudflare RealtimeKit meetings — unlike sendPushNotification above,
+  // callers need the actual response (a meetingId, an auth token), so this
+  // throws on failure instead of swallowing it, and returns the parsed body
+  // on success.
+  async function callLiveWorker(path, body) {
+    const res = await fetch(`${PUSH_WORKER_URL}${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ secret: PUSH_SHARED_SECRET, ...body }),
+    });
+    if (!res.ok) {
+      const text = await res.text().catch(() => "");
+      throw new Error(text || `Request failed (${res.status})`);
+    }
+    return res.json();
   }
   // sw.js's onBackgroundMessage only fires while this tab ISN'T focused —
   // with the app open, FCM instead hands the message to this listener,
@@ -281,6 +303,265 @@ function MatchTabBar({ tabs, active, onChange, children }) {
       </div>
       <div style={{ border: `1px solid ${COLORS.line}`, borderTop: "none", borderRadius: "0 0 12px 12px", padding: 16 }}>
         {children}
+      </div>
+    </div>
+  );
+}
+// Shown to everyone watching once a match has an active liveMeetingId —
+// connects as a viewer the moment it mounts, tears the connection back
+// down the moment meetingId changes or this unmounts (match card
+// collapsed, tab switched away, or the broadcast itself ended and
+// liveMeetingId cleared). Deliberately has no "reconnect" button of its
+// own — if the connection drops, collapsing and re-expanding the card
+// (which remounts this) is the recovery path, same spirit as everything
+// else in this app staying simple over clever. viewerId/viewerName are
+// optional — omit them (as the admin view does, which has no player
+// identity to hand over) and a throwaway anonymous id is used instead.
+function LiveViewer({ meetingId, viewerId, viewerName }) {
+  const videoRef = React.useRef(null);
+  const sessionRef = React.useRef(null);
+  const idRef = React.useRef(viewerId || `viewer-${Math.random().toString(36).slice(2)}`);
+  const [status, setStatus] = useState("connecting"); // connecting | live | error
+  const [errorMsg, setErrorMsg] = useState("");
+  // Browsers silently block autoplay of anything with sound unless it
+  // starts muted — no error, the video just never plays. Starting muted
+  // and letting the viewer tap to unmute (a real user gesture, which
+  // browsers do allow to start audio) is the standard way around that.
+  const [muted, setMuted] = useState(true);
+  // Bumped on every "Try again" tap — in the effect's dependency array
+  // purely to force a fresh connection attempt without needing a whole
+  // separate retry code path.
+  const [retryCount, setRetryCount] = useState(0);
+
+  useEffect(() => {
+    let cancelled = false;
+    setStatus("connecting");
+    setErrorMsg("");
+    (async () => {
+      // 20s to actually see the broadcaster's track arrive — generous
+      // enough for a slow join, bounded so a viewer opening the match
+      // before anyone's live doesn't wait forever.
+      const res = await startWatchingLive(meetingId, idRef.current, viewerName, 20000);
+      if (cancelled) {
+        if (res.ok) stopWatchingLive(res.session);
+        return;
+      }
+      if (!res.ok) {
+        setStatus("error");
+        setErrorMsg(res.error);
+        return;
+      }
+      if (videoRef.current) {
+        videoRef.current.srcObject = res.session.stream;
+        videoRef.current.play().catch(() => {});
+      }
+      sessionRef.current = res.session;
+      setStatus("live");
+    })();
+    return () => {
+      cancelled = true;
+      stopWatchingLive(sessionRef.current);
+      sessionRef.current = null;
+    };
+  }, [meetingId, retryCount]);
+
+  function handleUnmute() {
+    if (videoRef.current) {
+      videoRef.current.muted = false;
+      videoRef.current.play().catch(() => {});
+    }
+    setMuted(false);
+  }
+
+  return (
+    <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: "#000", marginBottom: 14 }}>
+      <video
+        ref={videoRef} autoPlay playsInline muted={muted}
+        style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover", background: "#000" }}
+      />
+      <div style={{ position: "absolute", top: 10, left: 10, background: "#D62828", color: "#fff", fontSize: 10, fontWeight: 800, padding: "4px 9px", borderRadius: 20, letterSpacing: 0.03 }}>
+        🔴 LIVE
+      </div>
+      {status === "live" && muted && (
+        <button
+          onClick={handleUnmute}
+          style={{ position: "absolute", bottom: 10, right: 10, background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: 20, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}
+        >
+          🔇 Tap for sound
+        </button>
+      )}
+      {status !== "live" && (
+        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, color: "#fff", fontSize: 12, background: "rgba(0,0,0,0.55)", padding: 20, textAlign: "center" }}>
+          {status === "connecting" ? "Connecting…" : errorMsg}
+          {status === "error" && (
+            <button
+              onClick={() => setRetryCount((c) => c + 1)}
+              style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+            >
+              Try again
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+// The broadcaster's own screen — camera preview, a live status line, and
+// Stop. Closing this any way (the ✕ or Stop itself) ends the broadcast;
+// there's deliberately no "minimize and keep going" option, since the
+// broadcaster's phone has to stay on this screen for the stream to keep
+// working at all — leaving that ambiguous would be worse than just
+// always stopping on close.
+function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadcasterId, broadcasterName }) {
+  const videoRef = React.useRef(null);
+  const sessionRef = React.useRef(null);
+  const [status, setStatus] = useState("starting"); // starting | live | error
+  const [errorMsg, setErrorMsg] = useState("");
+  // Camera zoom is a real hardware/browser capability, not something every
+  // device offers — Chromium on Android exposes it via a "zoom" constraint
+  // on the video track; iOS Safari and Firefox don't support it at all as
+  // of writing. Feature-detected below rather than assumed, so the slider
+  // only ever shows up where it'll actually do something. null = not
+  // available (or not checked yet); otherwise { min, max, step, value }.
+  const [zoom, setZoom] = useState(null);
+  // Who's currently watching — [{ id, name }]. Polled rather than wired to
+  // an SDK "participant joined/left" event: this Beta SDK's exact event
+  // names have already turned out unreliable once this session (see
+  // attachRemoteTracks), and a 2s poll is simple, robust, and plenty fast
+  // for a viewer list that's just informational, not real-time-critical.
+  const [viewers, setViewers] = useState([]);
+  const [showViewers, setShowViewers] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    let viewerPoll = null;
+    (async () => {
+      const res = await startLiveBroadcast(matchLabel, broadcasterId, broadcasterName);
+      if (cancelled) {
+        if (res.ok) stopLiveBroadcast(res.session);
+        return;
+      }
+      if (!res.ok) {
+        setStatus("error");
+        setErrorMsg(res.error);
+        return;
+      }
+      sessionRef.current = res.session;
+      if (videoRef.current) videoRef.current.srcObject = res.session.stream;
+      setStatus("live");
+      onStarted(res.session.meetingId);
+
+      const track = res.session.stream.getVideoTracks()[0];
+      if (track && track.getCapabilities) {
+        try {
+          const caps = track.getCapabilities();
+          if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+            const settings = track.getSettings ? track.getSettings() : {};
+            setZoom({ min: caps.zoom.min, max: caps.zoom.max, step: caps.zoom.step || 0.1, value: settings.zoom || caps.zoom.min });
+          }
+        } catch (e) {
+          // No zoom capability reported — the slider just stays hidden.
+        }
+      }
+
+      function pollViewers() {
+        try {
+          const list = [];
+          res.session.meeting.participants.joined.forEach((p) => {
+            list.push({ id: p.id, name: p.name || "Viewer" });
+          });
+          setViewers(list);
+        } catch (e) {
+          // SDK shape may differ — the list just won't update this tick.
+        }
+      }
+      pollViewers();
+      viewerPoll = setInterval(pollViewers, 2000);
+    })();
+    return () => {
+      cancelled = true;
+      if (viewerPoll) clearInterval(viewerPoll);
+      stopLiveBroadcast(sessionRef.current);
+      sessionRef.current = null;
+    };
+    // Deliberately mount-once (empty deps) — every prop here is only ever
+    // read inside the async callback above, not on every render, so none
+    // of them need to be dependencies.
+  }, []);
+
+  function handleZoomChange(rawValue) {
+    const value = Number(rawValue);
+    const track = sessionRef.current && sessionRef.current.stream.getVideoTracks()[0];
+    if (track) track.applyConstraints({ advanced: [{ zoom: value }] }).catch(() => {});
+    setZoom((z) => (z ? { ...z, value } : z));
+  }
+
+  function handleStop() {
+    stopLiveBroadcast(sessionRef.current);
+    sessionRef.current = null;
+    if (status === "live") onStopped();
+    onClose();
+  }
+
+  return (
+    <div style={{ position: "fixed", top: 0, right: 0, bottom: 0, left: 0, background: "rgba(0,0,0,0.85)", zIndex: 240, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 20 }}>
+      <div style={{ width: "100%", maxWidth: 420 }}>
+        <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: "#111", marginBottom: 16 }}>
+          <video
+            ref={videoRef} autoPlay playsInline muted
+            style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover", background: "#111" }}
+          />
+          {status === "live" && (
+            <div style={{ position: "absolute", top: 10, left: 10, background: "#D62828", color: "#fff", fontSize: 10, fontWeight: 800, padding: "4px 9px", borderRadius: 20 }}>
+              🔴 LIVE
+            </div>
+          )}
+          {status !== "live" && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 12, background: "rgba(0,0,0,0.55)", padding: 20, textAlign: "center" }}>
+              {status === "starting" ? "Starting your camera…" : errorMsg}
+            </div>
+          )}
+          {status === "live" && zoom && (
+            <div style={{ position: "absolute", left: 12, right: 12, bottom: 10, display: "flex", alignItems: "center", gap: 8, background: "rgba(0,0,0,0.55)", borderRadius: 20, padding: "6px 12px" }}>
+              <span style={{ fontSize: 12 }}>🔍</span>
+              <input
+                type="range" min={zoom.min} max={zoom.max} step={zoom.step} value={zoom.value}
+                onChange={(e) => handleZoomChange(e.target.value)}
+                style={{ flex: 1 }}
+              />
+              <span style={{ fontSize: 10, color: "#fff", minWidth: 28, textAlign: "right" }}>{(zoom.min > 0 ? zoom.value / zoom.min : zoom.value).toFixed(1)}x</span>
+            </div>
+          )}
+        </div>
+        {status === "live" && (
+          <div style={{ marginBottom: 14 }}>
+            <button
+              onClick={() => setShowViewers((v) => !v)}
+              style={{ width: "100%", background: "rgba(255,255,255,0.08)", border: "none", color: "#fff", borderRadius: 10, padding: "9px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}
+            >
+              <span>👀 {viewers.length} watching</span>
+              <span style={{ fontSize: 11, color: "#B7C4B8" }}>{showViewers ? "Hide ←" : "Show →"}</span>
+            </button>
+            {showViewers && (
+              <div style={{ marginTop: 6, background: "rgba(255,255,255,0.05)", borderRadius: 10, padding: viewers.length ? "8px 12px" : "12px", fontSize: 12, color: "#fff" }}>
+                {viewers.length === 0 ? (
+                  <span style={{ color: "#B7C4B8" }}>No one's joined yet.</span>
+                ) : (
+                  viewers.map((v) => <div key={v.id} style={{ padding: "4px 0" }}>{v.name}</div>)
+                )}
+              </div>
+            )}
+          </div>
+        )}
+        <div style={{ fontSize: 11, color: "#B7C4B8", textAlign: "center", marginBottom: 14 }}>
+          Keep this screen open and your phone unlocked — the broadcast pauses if you switch apps or lock the screen.
+        </div>
+        <button
+          onClick={handleStop}
+          style={{ width: "100%", background: status === "live" ? "#D62828" : "rgba(255,255,255,0.15)", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+        >
+          {status === "live" ? "⏹ Stop broadcasting" : "Cancel"}
+        </button>
       </div>
     </div>
   );
@@ -815,6 +1096,147 @@ async function enableBrowserPush(playerId, updatePlayerFcmToken) {
     console.error("enable push failed", e);
     return { ok: false, error: "Couldn't enable notifications — try again." };
   }
+}
+// RealtimeKit has no getUserMedia-style facingMode hint — the browser's
+// default camera choice on a phone is usually the front (selfie) one,
+// which is wrong for filming a match. This asks the SDK for the device
+// list and switches to whichever one's label suggests it's the rear
+// camera, best-effort — if no label matches (some browsers only expose
+// generic names) it just leaves whatever camera was already on rather
+// than guessing wrong.
+async function preferRearCamera(meeting) {
+  try {
+    const devices = await meeting.self.getVideoDevices();
+    const rear = (devices || []).find((d) => /back|rear|environment/i.test(d.label || ""));
+    if (rear) await meeting.self.setDevice(rear);
+  } catch (e) {
+    // Best-effort only — broadcaster can still switch manually if their
+    // browser doesn't expose a matching label.
+  }
+}
+// Walks a broadcaster all the way from "tap Go Live" to actually pushing
+// video to Cloudflare, via RealtimeKit: the Worker opens a meeting and
+// mints a host token (full publish rights), then RealtimeKit's own SDK
+// takes the camera/mic permission prompt and the actual media negotiation
+// off this app's hands entirely — no manual RTCPeerConnection/SDP juggling
+// needed the way the raw-SFU version required. Returns { ok: true, session }
+// holding everything stopLiveBroadcast needs to tear this back down, or
+// { ok: false, error } if any step failed.
+async function startLiveBroadcast(matchLabel, broadcasterId, broadcasterName) {
+  if (typeof RealtimeKitClient === "undefined") {
+    return { ok: false, error: "Live video isn't supported in this browser." };
+  }
+  let meetingId;
+  let meeting;
+  try {
+    const started = await callLiveWorker("/live/start", { matchLabel, broadcasterId, broadcasterName });
+    meetingId = started.meetingId;
+    meeting = await RealtimeKitClient.init({ authToken: started.authToken });
+    await meeting.join();
+    await meeting.self.enableVideo();
+    await meeting.self.enableAudio();
+    await preferRearCamera(meeting);
+
+    const stream = new MediaStream();
+    if (meeting.self.videoTrack) stream.addTrack(meeting.self.videoTrack);
+    if (meeting.self.audioTrack) stream.addTrack(meeting.self.audioTrack);
+
+    return { ok: true, session: { meeting, meetingId, stream } };
+  } catch (e) {
+    if (meeting) { try { meeting.leave(); } catch {} }
+    console.error("startLiveBroadcast failed", e);
+    return { ok: false, error: "Couldn't start the live broadcast — " + (e.message || "check camera/mic permission and try again") };
+  }
+}
+// Best-effort teardown — the browser leaves the meeting regardless of
+// whether telling the Worker about it succeeds, so a flaky network on the
+// way out never leaves the broadcaster's camera light stuck on.
+function stopLiveBroadcast(session) {
+  if (!session) return;
+  if (session.meeting) { try { session.meeting.leave(); } catch {} }
+  if (session.meetingId) {
+    callLiveWorker("/live/end", { meetingId: session.meetingId }).catch(() => {});
+  }
+}
+// RealtimeKit hands remote video/audio as properties on each participant
+// object rather than a single ready-made MediaStream — this stitches
+// whichever participant is currently in the room (there's only ever one:
+// the broadcaster) into a regular MediaStream a <video> element can play.
+//
+// This app originally tried RealtimeKit's "Interactive Livestream" feature
+// (meeting.livestream.start(), HLS playback) instead of this, since it's
+// built for exactly this one-to-many scenario — but as of writing, that
+// feature's viewer-side status check calls a Cloudflare API domain that
+// has since been retired, so it 404s for every viewer regardless of
+// network. Falling back to plain WebRTC participant tracks instead: the
+// underlying SFU still only asks the broadcaster's phone for one upload no
+// matter how many viewers connect, so the actual scaling story is
+// unchanged — this is a delivery-mechanism swap, not a step down.
+function attachRemoteTracks(meeting, stream, added) {
+  try {
+    meeting.participants.joined.forEach((p) => {
+      if (p.videoTrack && !added.has(p.id + ":v")) { stream.addTrack(p.videoTrack); added.add(p.id + ":v"); }
+      if (p.audioTrack && !added.has(p.id + ":a")) { stream.addTrack(p.audioTrack); added.add(p.id + ":a"); }
+    });
+  } catch (e) {
+    // SDK event/shape names for this are thin on real-world documentation
+    // (Beta product) — the poll in startWatchingLive keeps retrying
+    // regardless, so one failed attempt here isn't fatal.
+  }
+}
+// The watching side — asks the Worker to add this viewer into the
+// broadcaster's already-open meeting, then waits for the broadcaster's
+// video track to actually show up on the participant list (event-driven,
+// backed by a poll as a fallback — see attachRemoteTracks above). Bounded
+// so a viewer opening a match before anyone's gone live doesn't wait
+// forever; "Try again" (see LiveViewer) re-runs this from scratch.
+async function startWatchingLive(meetingId, viewerId, viewerName, timeoutMs) {
+  if (typeof RealtimeKitClient === "undefined") {
+    return { ok: false, error: "Live video isn't supported in this browser." };
+  }
+  let meeting;
+  try {
+    const joined = await callLiveWorker("/live/join", { meetingId, viewerId, viewerName });
+    // group_call_participant auto-enables camera/mic on join by default
+    // (it's a symmetric "everyone can be seen" preset, not a dedicated
+    // viewer role) — this overrides that so a viewer never gets a
+    // camera/mic prompt, regardless of what the preset itself allows.
+    meeting = await RealtimeKitClient.init({ authToken: joined.authToken, defaults: { audio: false, video: false } });
+    await meeting.join();
+
+    const remoteStream = new MediaStream();
+    const added = new Set();
+    attachRemoteTracks(meeting, remoteStream, added);
+    const poll = setInterval(() => attachRemoteTracks(meeting, remoteStream, added), 1000);
+    try {
+      meeting.participants.joined.on("participantJoined", () => attachRemoteTracks(meeting, remoteStream, added));
+    } catch (e) {
+      // Falls back to the poll above if this particular event name isn't right.
+    }
+
+    const gotTrack = await new Promise((resolve) => {
+      if (remoteStream.getTracks().length > 0) { resolve(true); return; }
+      const check = setInterval(() => {
+        if (remoteStream.getTracks().length > 0) { clearInterval(check); resolve(true); }
+      }, 300);
+      setTimeout(() => { clearInterval(check); resolve(remoteStream.getTracks().length > 0); }, timeoutMs || 20000);
+    });
+    if (!gotTrack) {
+      clearInterval(poll);
+      throw new Error("the stream hasn't reached this device yet — tap Try again");
+    }
+
+    return { ok: true, session: { meeting, stream: remoteStream, poll } };
+  } catch (e) {
+    if (meeting) { try { meeting.leave(); } catch {} }
+    console.error("startWatchingLive failed", e);
+    return { ok: false, error: "Couldn't connect to the live stream — " + (e.message || "try again") };
+  }
+}
+function stopWatchingLive(session) {
+  if (!session) return;
+  if (session.poll) clearInterval(session.poll);
+  if (session.meeting) { try { session.meeting.leave(); } catch {} }
 }
 // Greedy nearest-neighbor from the driver's own start point. Only ever
 // orders riders who've shared a real coordinate; anyone who hasn't
@@ -2654,6 +3076,19 @@ function CricketNetsTracker() {
       body: `${cleanField(match.groundName, match.matchType || "Match")} — ${when}. Confirm your availability.`,
     });
   }
+  // Broadcasts to everyone opted in except the broadcaster themselves —
+  // same "whole squad, no throttling" treatment as a new match, since
+  // going live is exactly the kind of thing everyone wants to know about
+  // right away.
+  function notifyMatchLive(match, broadcasterId) {
+    const tokens = players.filter((p) => p.id !== broadcasterId).map((p) => p.fcmToken).filter(Boolean);
+    if (tokens.length === 0) return;
+    sendPushNotification({
+      tokens,
+      title: "🔴 Live now!",
+      body: `${cleanField(match.groundName, match.matchType || "The match")} is being streamed live — open the app to watch.`,
+    });
+  }
   // Just the one player who was actually promoted — not a broadcast.
   function notifyPromoted(playerId) {
     const p = players.find((pl) => pl.id === playerId);
@@ -2688,6 +3123,17 @@ function CricketNetsTracker() {
       tokens,
       title: "🎾 Nets update",
       body: `${voter.name} ${available ? "confirmed for" : "can't make"} nets on ${fmtDateLong(iso)}.`,
+    });
+  }
+  // Same "whole squad, no throttling" treatment as notifyMatchLive, for a
+  // nets day going live instead of a match.
+  function notifyNetsLive(iso, broadcasterId) {
+    const tokens = players.filter((p) => p.id !== broadcasterId).map((p) => p.fcmToken).filter(Boolean);
+    if (tokens.length === 0) return;
+    sendPushNotification({
+      tokens,
+      title: "🔴 Live now!",
+      body: `Nets on ${fmtDateLong(iso)} is being streamed live — open the app to watch.`,
     });
   }
   function notifyPerformerTagged(match, category, playerId) {
@@ -3419,6 +3865,37 @@ function CricketNetsTracker() {
       return { ...prev, [matchId]: { ...prev[matchId], [field]: value } };
     });
   }
+  // Called once LiveBroadcastModal has actually gotten video flowing
+  // through RealtimeKit — liveMeetingId/liveBroadcasterId just ride on the
+  // match object as two more fields, same as everything else
+  // updateMatchField already touches, no new Firestore key or rules
+  // change needed.
+  function startMatchLive(matchId, meetingId, broadcasterId) {
+    updateMatchField(matchId, "liveMeetingId", meetingId);
+    updateMatchField(matchId, "liveBroadcasterId", broadcasterId);
+    if (matches[matchId]) notifyMatchLive(matches[matchId], broadcasterId);
+  }
+  function stopMatchLive(matchId) {
+    updateMatchField(matchId, "liveMeetingId", null);
+    updateMatchField(matchId, "liveBroadcasterId", null);
+  }
+  // Same idea as startMatchLive/stopMatchLive, but nets days live in the
+  // `days` object (keyed by ISO date) rather than `matches` — no separate
+  // "session" record to create, liveMeetingId/liveBroadcasterId just ride
+  // on that day's entry the same way votes/hours/balls already do.
+  function startNetsLive(iso, meetingId, broadcasterId) {
+    setDays((prev) => {
+      const cur = prev[iso] || { votes: [], hours: 0, balls: 0 };
+      return { ...prev, [iso]: { ...cur, liveMeetingId: meetingId, liveBroadcasterId: broadcasterId } };
+    });
+    notifyNetsLive(iso, broadcasterId);
+  }
+  function stopNetsLive(iso) {
+    setDays((prev) => {
+      const cur = prev[iso] || { votes: [], hours: 0, balls: 0 };
+      return { ...prev, [iso]: { ...cur, liveMeetingId: null, liveBroadcasterId: null } };
+    });
+  }
   // Three states behind one button, cycling the same way the old two-state
   // toggle did: not-in → available (or waitlisted, if a capacity is set
   // and already full) → tapping again always leaves whichever of the two
@@ -4106,6 +4583,10 @@ function CricketNetsTracker() {
           toggleMarketplaceInterest={toggleMarketplaceInterest}
           closeMarketplaceListing={closeMarketplaceListing}
           deleteMarketplaceListing={deleteMarketplaceListing}
+          onMatchLiveStarted={startMatchLive}
+          onMatchLiveStopped={stopMatchLive}
+          onNetsLiveStarted={startNetsLive}
+          onNetsLiveStopped={stopNetsLive}
         />
       )}
 
@@ -4209,6 +4690,9 @@ function CricketNetsTracker() {
                 photos={photos}
                 onViewPhoto={openTopLevelPhoto}
                 notifyPendingVotesNudge={notifyPendingVotesNudge}
+                onNetsLiveStarted={startNetsLive}
+                onNetsLiveStopped={stopNetsLive}
+                teamName={teamRecord ? teamRecord.teamName : ""}
               />
             )}
             {tab === "sub" && (
@@ -4245,6 +4729,7 @@ function CricketNetsTracker() {
                 uploadMatchBanner={uploadMatchBanner} removeMatchBanner={removeMatchBanner}
                 uploadMatchQr={uploadMatchQr} removeMatchQr={removeMatchQr}
                 setMatchPerformerField={setMatchPerformerField} clearMatchPerformer={clearMatchPerformer}
+                onMatchLiveStarted={startMatchLive} onMatchLiveStopped={stopMatchLive}
                 teamName={teamRecord ? teamRecord.teamName : ""}
               />
             )}
@@ -5324,7 +5809,7 @@ function HighlightClipCard({ player, setPlayerVideo, removePlayerVideo, onView }
   );
 }
 
-function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, updateMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing, deleteMarketplaceListing }) {
+function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, updateMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing, deleteMarketplaceListing, onMatchLiveStarted, onMatchLiveStopped, onNetsLiveStarted, onNetsLiveStopped }) {
   const [selectedId, setSelectedId] = useState(() => (
     initialSelectedId && players.some((p) => p.id === initialSelectedId) ? initialSelectedId : ""
   ));
@@ -5385,6 +5870,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
   const openPhoto = (name, photo, preserveAspect) => setViewingPhoto({ name, photo, preserveAspect });
   const [viewingClip, setViewingClip] = useState(null); // { player, slotType } | null
   const openClip = (player, slotType) => setViewingClip({ player, slotType });
+  const [showNetsLiveModal, setShowNetsLiveModal] = useState(false);
 
   const authedPlayer = players.find((p) => p.id === authedPlayerId);
 
@@ -5482,7 +5968,12 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
             <>
               <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 18 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-                  <span style={{ fontSize: 15, fontWeight: 600 }}>{fmtDateShort(selectedDate)}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <span style={{ fontSize: 15, fontWeight: 600 }}>{fmtDateShort(selectedDate)}</span>
+                    {dayData.liveMeetingId && (
+                      <span style={{ fontSize: 11, fontWeight: 700, background: "#D62828", color: "#fff", padding: "3px 9px", borderRadius: 20 }}>🔴 LIVE</span>
+                    )}
+                  </div>
                   <button onClick={() => setShowFullDates((v) => !v)} style={{ background: "transparent", border: "none", color: COLORS.inkSoft, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}>
                     {showFullDates ? "Show less" : "Browse dates"} <Icon size={12}>{showFullDates ? "←" : "→"}</Icon>
                   </button>
@@ -5523,6 +6014,29 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
                       );
                     })}
                   </div>
+                )}
+
+                {dayData.liveMeetingId ? (
+                  <div style={{ marginBottom: 12 }}>
+                    <LiveViewer meetingId={dayData.liveMeetingId} viewerId={authedPlayer.id} viewerName={authedPlayer.name} />
+                    {dayData.liveBroadcasterId === authedPlayer.id && (
+                      <button
+                        onClick={() => onNetsLiveStopped && onNetsLiveStopped(selectedDate)}
+                        style={{ width: "100%", background: "transparent", border: `1px solid ${COLORS.leather}`, color: COLORS.leather, borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                      >
+                        ⏹ End live broadcast
+                      </button>
+                    )}
+                  </div>
+                ) : (
+                  selectedDate === today && onNetsLiveStarted && (
+                    <button
+                      onClick={() => setShowNetsLiveModal(true)}
+                      style={{ width: "100%", background: "#D62828", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
+                    >
+                      🔴 Go Live
+                    </button>
+                  )
                 )}
 
                 {isPastDate ? (
@@ -5669,6 +6183,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
               joinCarpoolDriver={joinCarpoolDriver} leaveCarpoolRide={leaveCarpoolRide} cancelCarpoolEntry={cancelCarpoolEntry}
               photos={photos} onViewPhoto={openPhoto} onViewClip={openClip}
               paymentDefault={paymentDefault} uploadMatchProof={uploadMatchProof} removeMatchProof={removeMatchProof}
+              onMatchLiveStarted={onMatchLiveStarted} onMatchLiveStopped={onMatchLiveStopped}
               teamName={teamRecord ? teamRecord.teamName : ""}
             />
           )}
@@ -5712,6 +6227,16 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
       </div>
       {viewingPhoto && <PhotoViewerModal name={viewingPhoto.name} photo={viewingPhoto.photo} preserveAspect={viewingPhoto.preserveAspect} onClose={() => setViewingPhoto(null)} />}
       {viewingClip && <ClipViewerModal playerName={viewingClip.player.name} tag={viewingClip.slotType} url={viewingClip.slotType === "Bowling" ? viewingClip.player.bowlingVideoUrl : viewingClip.player.battingVideoUrl} onClose={() => setViewingClip(null)} />}
+      {showNetsLiveModal && (
+        <LiveBroadcastModal
+          matchLabel={`Nets session · ${fmtDateShort(selectedDate)}`}
+          broadcasterId={authedPlayer.id}
+          broadcasterName={authedPlayer.name}
+          onClose={() => setShowNetsLiveModal(false)}
+          onStarted={(meetingId) => onNetsLiveStarted(selectedDate, meetingId, authedPlayer.id)}
+          onStopped={() => onNetsLiveStopped && onNetsLiveStopped(selectedDate)}
+        />
+      )}
       </>
     );
   }
@@ -6007,7 +6532,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
   );
 }
 
-function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, photos, onViewPhoto, onViewClip, paymentDefault, uploadMatchProof, removeMatchProof, teamName }) {
+function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, photos, onViewPhoto, onViewClip, paymentDefault, uploadMatchProof, removeMatchProof, onMatchLiveStarted, onMatchLiveStopped, teamName }) {
   const matchList = Object.values(matches || {}).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   const canPayInline = isMobileDevice();
   // One match expanded at a time — same mechanism MatchesAdminTab already
@@ -6026,6 +6551,11 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
   // one flat value) means switching between matches never leaks one
   // match's tab choice onto another.
   const [activeTabs, setActiveTabs] = useState({});
+  // Which match's Go Live modal is open, if any — a single shared value
+  // rather than one per match, since a player only ever broadcasts one
+  // match at a time from their own account (same reasoning as `locating`
+  // above for the GPS flag).
+  const [liveModalMatchId, setLiveModalMatchId] = useState(null);
   async function handleUseMyLocation(matchId, playerId) {
     setLocating(true);
     const loc = await getCurrentLocation();
@@ -6050,6 +6580,7 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
   }
 
   return (
+    <>
     <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
       {matchList.map((m) => {
         const availableIds = m.available || [];
@@ -6110,6 +6641,11 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
                 <Icon size={16} color={COLORS.inkSoft}>{expanded ? "←" : "→"}</Icon>
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                {m.liveMeetingId && (
+                  <span style={{ fontSize: 11, fontWeight: 700, background: "#D62828", color: "#fff", padding: "3px 9px", borderRadius: 20 }}>
+                    🔴 LIVE
+                  </span>
+                )}
                 <span style={{ fontSize: 11, fontWeight: 600, background: myStatus.bg, color: myStatus.text, padding: "3px 9px", borderRadius: 20 }}>
                   {myStatus.label}
                 </span>
@@ -6146,6 +6682,29 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
                 )}
               </div>
             </div>
+
+            {m.liveMeetingId ? (
+              <div style={{ marginBottom: 12 }}>
+                <LiveViewer meetingId={m.liveMeetingId} viewerId={authedPlayer.id} viewerName={authedPlayer.name} />
+                {m.liveBroadcasterId === authedPlayer.id && (
+                  <button
+                    onClick={() => onMatchLiveStopped && onMatchLiveStopped(m.id)}
+                    style={{ width: "100%", background: "transparent", border: `1px solid ${COLORS.leather}`, color: COLORS.leather, borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+                  >
+                    ⏹ End live broadcast
+                  </button>
+                )}
+              </div>
+            ) : (
+              available && onMatchLiveStarted && (
+                <button
+                  onClick={() => setLiveModalMatchId(m.id)}
+                  style={{ width: "100%", background: "#D62828", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer", marginBottom: 12, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
+                >
+                  🔴 Go Live
+                </button>
+              )
+            )}
 
             <MatchTabBar tabs={PLAYER_MATCH_TABS} active={activeTab} onChange={setActiveTab}>
               {activeTab === "squad" && (
@@ -6565,6 +7124,20 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
         );
       })}
     </div>
+    {liveModalMatchId && (
+      <LiveBroadcastModal
+        matchLabel={(() => {
+          const lm = matchList.find((mm) => mm.id === liveModalMatchId);
+          return lm ? `${lm.matchType || "Match"} · ${lm.groundName || "Ground TBD"}` : "Pavilion Live";
+        })()}
+        broadcasterId={authedPlayer.id}
+        broadcasterName={authedPlayer.name}
+        onClose={() => setLiveModalMatchId(null)}
+        onStarted={(meetingId) => onMatchLiveStarted(liveModalMatchId, meetingId, authedPlayer.id)}
+        onStopped={() => onMatchLiveStopped && onMatchLiveStopped(liveModalMatchId)}
+      />
+    )}
+    </>
   );
 }
 
@@ -6679,13 +7252,15 @@ function RegisterView({
   );
 }
 
-function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote, setDayField, activeMonth, isLocked, weekendExceptions, addWeekendException, removeWeekendException, photos, onViewPhoto, notifyPendingVotesNudge }) {
+function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote, setDayField, activeMonth, isLocked, weekendExceptions, addWeekendException, removeWeekendException, photos, onViewPhoto, notifyPendingVotesNudge, onNetsLiveStarted, onNetsLiveStopped, teamName }) {
   const [copied, setCopied] = useState(false);
   const [showFullDates, setShowFullDates] = useState(false);
   const [showAllPlayers, setShowAllPlayers] = useState(false);
   const [showAddSpecial, setShowAddSpecial] = useState(false);
   const [specialDateInput, setSpecialDateInput] = useState("");
   const [specialError, setSpecialError] = useState("");
+  const [showLiveModal, setShowLiveModal] = useState(false);
+  const today = todayISO();
   const n = daysInMonth(activeMonth);
   const monthExceptions = Object.keys(weekendExceptions || {}).filter((iso) => iso.startsWith(activeMonth)).sort();
   const dateOptions = Array.from({ length: n }, (_, i) => `${activeMonth}-${String(i + 1).padStart(2, "0")}`)
@@ -6745,7 +7320,12 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
       )}
       <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
-          <span style={{ fontSize: 15, fontWeight: 600 }}>{fmtDateShort(selectedDate)}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span style={{ fontSize: 15, fontWeight: 600 }}>{fmtDateShort(selectedDate)}</span>
+            {dayData.liveMeetingId && (
+              <span style={{ fontSize: 11, fontWeight: 700, background: "#D62828", color: "#fff", padding: "3px 9px", borderRadius: 20 }}>🔴 LIVE</span>
+            )}
+          </div>
           <button onClick={() => setShowFullDates((v) => !v)} style={{ background: "transparent", border: "none", color: COLORS.inkSoft, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", gap: 4 }}>
             {showFullDates ? "Show less" : "Week view"} <Icon size={12}>{showFullDates ? "←" : "→"}</Icon>
           </button>
@@ -6823,6 +7403,37 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
           </div>
         )}
       </div>
+
+      {dayData.liveMeetingId ? (
+        <div style={{ marginBottom: 14 }}>
+          <LiveViewer meetingId={dayData.liveMeetingId} />
+          <button
+            onClick={() => onNetsLiveStopped && onNetsLiveStopped(selectedDate)}
+            style={{ width: "100%", background: "transparent", border: `1px solid ${COLORS.leather}`, color: COLORS.leather, borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+          >
+            ⏹ End live broadcast
+          </button>
+        </div>
+      ) : (
+        selectedDate === today && onNetsLiveStarted && (
+          <button
+            onClick={() => setShowLiveModal(true)}
+            style={{ width: "100%", background: "#D62828", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
+          >
+            🔴 Go Live
+          </button>
+        )
+      )}
+      {showLiveModal && (
+        <LiveBroadcastModal
+          matchLabel={`Nets session · ${fmtDateShort(selectedDate)}`}
+          broadcasterId={null}
+          broadcasterName={teamName || "Admin"}
+          onClose={() => setShowLiveModal(false)}
+          onStarted={(meetingId) => onNetsLiveStarted(selectedDate, meetingId, null)}
+          onStopped={() => onNetsLiveStopped && onNetsLiveStopped(selectedDate)}
+        />
+      )}
 
       <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 14 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
@@ -8203,7 +8814,7 @@ function MarketplaceListingCard({ listing, photoList, players, photos, teamName,
 
 const EMPTY_MATCH_FORM = { matchType: "", groundName: "", date: "", time: "", overs: "", ballType: "", jersey: "", locationUrl: "", capacity: "", upiNumber: "", paymentQr: null, banner: null };
 
-function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, teamName }) {
+function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, onMatchLiveStarted, onMatchLiveStopped, teamName }) {
   const [showNewForm, setShowNewForm] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
   const [form, setForm] = useState(EMPTY_MATCH_FORM);
@@ -8407,6 +9018,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
               uploadMatchQr={uploadMatchQr} removeMatchQr={removeMatchQr}
               setMatchPerformerField={setMatchPerformerField} clearMatchPerformer={clearMatchPerformer}
               onDuplicate={duplicateMatch}
+              onMatchLiveStarted={onMatchLiveStarted} onMatchLiveStopped={onMatchLiveStopped}
               teamName={teamName}
             />
           ))}
@@ -8416,7 +9028,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
   );
 }
 
-function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpand, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, knownGrounds, knownGroundLocations, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, onDuplicate, teamName }) {
+function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpand, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, knownGrounds, knownGroundLocations, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, onDuplicate, onMatchLiveStarted, onMatchLiveStopped, teamName }) {
   const [copiedPerformers, setCopiedPerformers] = useState(false);
   async function handleCopyPerformers() {
     const ok = await copyText(buildMatchPerformersMessage(match, players, teamName));
@@ -8446,6 +9058,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
   const [viewingProofOf, setViewingProofOf] = useState(null); // player id | null
   const [sharePayBusy, setSharePayBusy] = useState(false);
   const [activeTab, setActiveTab] = useState("squad");
+  const [showLiveModal, setShowLiveModal] = useState(false);
   const PREVIEW_ROWS = 5;
 
   // .map() over the ids — not players.filter() — because match.available
@@ -8549,7 +9162,12 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
             </button>
           </div>
         </div>
-        <div onClick={onToggleExpand} style={{ cursor: "pointer", display: "flex", gap: 8, marginTop: 10 }}>
+        <div onClick={onToggleExpand} style={{ cursor: "pointer", display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+          {match.liveMeetingId && (
+            <span style={{ fontSize: 11, fontWeight: 700, background: "#D62828", color: "#fff", padding: "3px 9px", borderRadius: 20, display: "flex", alignItems: "center", gap: 4 }}>
+              🔴 LIVE
+            </span>
+          )}
           <span style={{ fontSize: 11, background: "#EEEAD9", color: COLORS.inkSoft, padding: "3px 9px", borderRadius: 20 }}>{availablePlayers.length} available</span>
           {match.totalCost && (
             <span style={{ fontSize: 11, background: allPaid ? "#EAF3E4" : "#FAEEDA", color: allPaid ? "#3B6D11" : "#854F0B", padding: "3px 9px", borderRadius: 20 }}>
@@ -8571,6 +9189,26 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
 
       {expanded && (
         <div style={{ padding: "0 16px 16px" }}>
+          {match.liveMeetingId ? (
+            <div style={{ marginBottom: 14 }}>
+              <LiveViewer meetingId={match.liveMeetingId} />
+              <button
+                onClick={() => onMatchLiveStopped && onMatchLiveStopped(match.id)}
+                style={{ width: "100%", background: "transparent", border: `1px solid ${COLORS.leather}`, color: COLORS.leather, borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+              >
+                ⏹ End live broadcast
+              </button>
+            </div>
+          ) : (
+            onMatchLiveStarted && (
+              <button
+                onClick={() => setShowLiveModal(true)}
+                style={{ width: "100%", background: "#D62828", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}
+              >
+                🔴 Go Live
+              </button>
+            )
+          )}
           <MatchTabBar tabs={ADMIN_MATCH_TABS} active={activeTab} onChange={setActiveTab}>
             {activeTab === "squad" && (
               <>
@@ -9157,6 +9795,16 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
         alreadyPaid={!!(match.payments || {})[viewingProofOf]}
         onClose={() => setViewingProofOf(null)}
         onConfirmPaid={() => { toggleMatchPaid(match.id, viewingProofOf); setViewingProofOf(null); }}
+      />
+    )}
+    {showLiveModal && (
+      <LiveBroadcastModal
+        matchLabel={`${match.matchType || "Match"} · ${match.groundName || "Ground TBD"}`}
+        broadcasterId={null}
+        broadcasterName={teamName || "Admin"}
+        onClose={() => setShowLiveModal(false)}
+        onStarted={(meetingId) => onMatchLiveStarted(match.id, meetingId, null)}
+        onStopped={() => onMatchLiveStopped && onMatchLiveStopped(match.id)}
       />
     )}
     </>
