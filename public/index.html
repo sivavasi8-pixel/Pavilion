@@ -332,9 +332,16 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
   // purely to force a fresh connection attempt without needing a whole
   // separate retry code path.
   const [retryCount, setRetryCount] = useState(0);
+  const [meetingObj, setMeetingObj] = useState(null);
+  // Total joined participants minus the one broadcaster — an
+  // approximation (it assumes exactly one host), not an exact headcount,
+  // but good enough for "roughly how many people are watching".
+  const [viewerCount, setViewerCount] = useState(0);
+  const [showChat, setShowChat] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
+    let countPoll = null;
     setStatus("connecting");
     setErrorMsg("");
     (async () => {
@@ -356,10 +363,24 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
         videoRef.current.play().catch(() => {});
       }
       sessionRef.current = res.session;
+      setMeetingObj(res.session.meeting);
       setStatus("live");
+
+      function pollCount() {
+        try {
+          let n = 0;
+          res.session.meeting.participants.joined.forEach(() => { n++; });
+          setViewerCount(Math.max(0, n - 1));
+        } catch (e) {
+          // SDK shape may differ — the count just won't update this tick.
+        }
+      }
+      pollCount();
+      countPoll = setInterval(pollCount, 2000);
     })();
     return () => {
       cancelled = true;
+      if (countPoll) clearInterval(countPoll);
       stopWatchingLive(sessionRef.current);
       sessionRef.current = null;
     };
@@ -374,35 +395,135 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
   }
 
   return (
-    <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: "#000", marginBottom: 14 }}>
-      <video
-        ref={videoRef} autoPlay playsInline muted={muted}
-        style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover", background: "#000" }}
-      />
-      <div style={{ position: "absolute", top: 10, left: 10, background: "#D62828", color: "#fff", fontSize: 10, fontWeight: 800, padding: "4px 9px", borderRadius: 20, letterSpacing: 0.03 }}>
-        🔴 LIVE
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: "#000" }}>
+        <video
+          ref={videoRef} autoPlay playsInline muted={muted}
+          style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover", background: "#000" }}
+        />
+        <div style={{ position: "absolute", top: 10, left: 10, background: "#D62828", color: "#fff", fontSize: 10, fontWeight: 800, padding: "4px 9px", borderRadius: 20, letterSpacing: 0.03 }}>
+          🔴 LIVE
+        </div>
+        {status === "live" && (
+          <div style={{ position: "absolute", top: 10, right: 10, background: "rgba(0,0,0,0.6)", color: "#fff", fontSize: 10, fontWeight: 700, padding: "4px 9px", borderRadius: 20 }}>
+            👀 {viewerCount}
+          </div>
+        )}
+        {status === "live" && muted && (
+          <button
+            onClick={handleUnmute}
+            style={{ position: "absolute", bottom: 10, right: 10, background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: 20, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}
+          >
+            🔇 Tap for sound
+          </button>
+        )}
+        {status === "live" && (
+          <button
+            onClick={() => setShowChat((v) => !v)}
+            style={{ position: "absolute", bottom: 10, left: 10, background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: 20, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+          >
+            💬 Chat
+          </button>
+        )}
+        {status !== "live" && (
+          <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, color: "#fff", fontSize: 12, background: "rgba(0,0,0,0.55)", padding: 20, textAlign: "center" }}>
+            {status === "connecting" ? "Connecting…" : errorMsg}
+            {status === "error" && (
+              <button
+                onClick={() => setRetryCount((c) => c + 1)}
+                style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+              >
+                Try again
+              </button>
+            )}
+          </div>
+        )}
       </div>
-      {status === "live" && muted && (
-        <button
-          onClick={handleUnmute}
-          style={{ position: "absolute", bottom: 10, right: 10, background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: 20, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}
-        >
-          🔇 Tap for sound
-        </button>
-      )}
-      {status !== "live" && (
-        <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, color: "#fff", fontSize: 12, background: "rgba(0,0,0,0.55)", padding: 20, textAlign: "center" }}>
-          {status === "connecting" ? "Connecting…" : errorMsg}
-          {status === "error" && (
-            <button
-              onClick={() => setRetryCount((c) => c + 1)}
-              style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
-            >
-              Try again
-            </button>
-          )}
+      {showChat && meetingObj && (
+        <div style={{ marginTop: 8 }}>
+          <LiveChatPanel meeting={meetingObj} />
         </div>
       )}
+    </div>
+  );
+}
+// Text chat during a broadcast — RealtimeKit's meeting.chat is shared
+// across everyone in the meeting (broadcaster and every viewer alike), so
+// this one component works for both LiveViewer and LiveBroadcastModal.
+// Backed by both the SDK's chatUpdate event and a 2s poll of
+// meeting.chat.messages — same defensive belt-and-suspenders as the rest
+// of this Beta SDK's event handling, since a missed/wrongly-named event
+// here would otherwise mean messages silently never show up.
+function LiveChatPanel({ meeting }) {
+  const [messages, setMessages] = useState([]);
+  const [draft, setDraft] = useState("");
+  const listRef = React.useRef(null);
+
+  useEffect(() => {
+    if (!meeting || !meeting.chat) return;
+    let cancelled = false;
+    function sync() {
+      try {
+        const list = meeting.chat.messages || [];
+        if (!cancelled) setMessages(list.slice());
+      } catch (e) {
+        // Chat may not be available on this preset/account — the panel
+        // just stays empty rather than breaking anything else.
+      }
+    }
+    sync();
+    const poll = setInterval(sync, 2000);
+    try { meeting.chat.on("chatUpdate", sync); } catch (e) {}
+    return () => {
+      cancelled = true;
+      clearInterval(poll);
+      try { meeting.chat.removeListener("chatUpdate", sync); } catch (e) {}
+    };
+  }, [meeting]);
+
+  useEffect(() => {
+    if (listRef.current) listRef.current.scrollTop = listRef.current.scrollHeight;
+  }, [messages.length]);
+
+  async function handleSend() {
+    const text = draft.trim();
+    if (!text || !meeting || !meeting.chat) return;
+    setDraft("");
+    try {
+      await meeting.chat.sendTextMessage(text);
+    } catch (e) {
+      console.error("send chat message failed", e);
+    }
+  }
+
+  return (
+    <div style={{ background: "rgba(0,0,0,0.75)", borderRadius: 10, padding: 10, display: "flex", flexDirection: "column", gap: 8 }}>
+      <div ref={listRef} style={{ maxHeight: 130, overflowY: "auto", display: "flex", flexDirection: "column", gap: 5 }}>
+        {messages.length === 0 ? (
+          <span style={{ color: "#B7C4B8", fontSize: 11 }}>No messages yet — say hi 👋</span>
+        ) : (
+          messages.map((m, i) => (
+            <div key={m.id || i} style={{ fontSize: 12, color: "#fff", lineHeight: 1.4 }}>
+              <b>{m.displayName || m.userName || m.name || "Someone"}:</b> {m.message || m.text || ""}
+            </div>
+          ))
+        )}
+      </div>
+      <div style={{ display: "flex", gap: 6 }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === "Enter") handleSend(); }}
+          placeholder="Say something…"
+          style={{ flex: 1, borderRadius: 8, border: "none", padding: "8px 10px", fontSize: 12 }}
+        />
+        <button
+          onClick={handleSend}
+          style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+        >
+          Send
+        </button>
+      </div>
     </div>
   );
 }
@@ -417,6 +538,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
   const sessionRef = React.useRef(null);
   const [status, setStatus] = useState("starting"); // starting | live | error
   const [errorMsg, setErrorMsg] = useState("");
+  const [meetingObj, setMeetingObj] = useState(null);
   // Camera zoom is a real hardware/browser capability, not something every
   // device offers — Chromium on Android exposes it via a "zoom" constraint
   // on the video track; iOS Safari and Firefox don't support it at all as
@@ -424,6 +546,13 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
   // only ever shows up where it'll actually do something. null = not
   // available (or not checked yet); otherwise { min, max, step, value }.
   const [zoom, setZoom] = useState(null);
+  // Torch (flashlight) — same Chromium/Android-only story as zoom, same
+  // feature-detection approach. null = unsupported, otherwise a boolean
+  // (on/off).
+  const [torchOn, setTorchOn] = useState(null);
+  const [audioOn, setAudioOn] = useState(true);
+  const [cameras, setCameras] = useState([]);
+  const [activeCameraId, setActiveCameraId] = useState("");
   // Who's currently watching — [{ id, name }]. Polled rather than wired to
   // an SDK "participant joined/left" event: this Beta SDK's exact event
   // names have already turned out unreliable once this session (see
@@ -431,6 +560,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
   // for a viewer list that's just informational, not real-time-critical.
   const [viewers, setViewers] = useState([]);
   const [showViewers, setShowViewers] = useState(false);
+  const [showChat, setShowChat] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -447,6 +577,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
         return;
       }
       sessionRef.current = res.session;
+      setMeetingObj(res.session.meeting);
       if (videoRef.current) videoRef.current.srcObject = res.session.stream;
       setStatus("live");
       onStarted(res.session.meetingId);
@@ -459,9 +590,19 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
             const settings = track.getSettings ? track.getSettings() : {};
             setZoom({ min: caps.zoom.min, max: caps.zoom.max, step: caps.zoom.step || 0.1, value: settings.zoom || caps.zoom.min });
           }
+          if (caps.torch) setTorchOn(false);
         } catch (e) {
-          // No zoom capability reported — the slider just stays hidden.
+          // No extra capabilities reported — zoom/torch controls just stay hidden.
         }
+      }
+
+      try {
+        const devices = await res.session.meeting.self.getVideoDevices();
+        setCameras(devices || []);
+        const settings = track && track.getSettings ? track.getSettings() : {};
+        if (settings.deviceId) setActiveCameraId(settings.deviceId);
+      } catch (e) {
+        // Device list unavailable — the picker just stays hidden.
       }
 
       function pollViewers() {
@@ -496,6 +637,71 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
     setZoom((z) => (z ? { ...z, value } : z));
   }
 
+  function handleToggleTorch() {
+    const track = sessionRef.current && sessionRef.current.stream.getVideoTracks()[0];
+    if (!track) return;
+    const next = !torchOn;
+    track.applyConstraints({ advanced: [{ torch: next }] }).catch(() => {});
+    setTorchOn(next);
+  }
+
+  async function handleToggleMic() {
+    const meeting = sessionRef.current && sessionRef.current.meeting;
+    if (!meeting) return;
+    try {
+      if (audioOn) await meeting.self.disableAudio();
+      else await meeting.self.enableAudio();
+      setAudioOn((v) => !v);
+    } catch (e) {
+      // SDK call failed — state stays as it was, so the button keeps
+      // reflecting reality rather than lying about it.
+    }
+  }
+
+  async function handleCameraChange(deviceId) {
+    const meeting = sessionRef.current && sessionRef.current.meeting;
+    const device = cameras.find((d) => d.deviceId === deviceId);
+    if (!meeting || !device) return;
+    try {
+      await meeting.self.setDevice(device);
+      setActiveCameraId(deviceId);
+
+      // setDevice swaps in a brand-new video track under the hood — the
+      // local preview (and zoom/torch, which both read the track off
+      // sessionRef.current.stream) were still holding the old, now-
+      // stopped track, which is why the broadcaster's own preview went
+      // black even though viewers — fed straight from RealtimeKit's
+      // servers, not this local object — kept seeing the new camera fine.
+      const freshStream = new MediaStream();
+      if (meeting.self.videoTrack) freshStream.addTrack(meeting.self.videoTrack);
+      if (meeting.self.audioTrack) freshStream.addTrack(meeting.self.audioTrack);
+      if (sessionRef.current) sessionRef.current.stream = freshStream;
+      if (videoRef.current) videoRef.current.srcObject = freshStream;
+
+      // Zoom/torch capabilities can differ per camera (e.g. a wide lens
+      // vs. a telephoto one) — re-check against the new track rather than
+      // trust whatever the previous camera reported.
+      const newTrack = meeting.self.videoTrack;
+      if (newTrack && newTrack.getCapabilities) {
+        try {
+          const caps = newTrack.getCapabilities();
+          if (caps.zoom && caps.zoom.max > caps.zoom.min) {
+            const settings = newTrack.getSettings ? newTrack.getSettings() : {};
+            setZoom({ min: caps.zoom.min, max: caps.zoom.max, step: caps.zoom.step || 0.1, value: settings.zoom || caps.zoom.min });
+          } else {
+            setZoom(null);
+          }
+          setTorchOn(caps.torch ? false : null);
+        } catch (e) {
+          setZoom(null);
+          setTorchOn(null);
+        }
+      }
+    } catch (e) {
+      // Camera switch failed — stays on whichever camera was already active.
+    }
+  }
+
   function handleStop() {
     stopLiveBroadcast(sessionRef.current);
     sessionRef.current = null;
@@ -506,7 +712,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
   return (
     <div style={{ position: "fixed", top: 0, right: 0, bottom: 0, left: 0, background: "rgba(0,0,0,0.85)", zIndex: 240, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", padding: 20 }}>
       <div style={{ width: "100%", maxWidth: 420 }}>
-        <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: "#111", marginBottom: 16 }}>
+        <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: "#111", marginBottom: 12 }}>
           <video
             ref={videoRef} autoPlay playsInline muted
             style={{ width: "100%", display: "block", aspectRatio: "16/9", objectFit: "cover", background: "#111" }}
@@ -514,6 +720,26 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
           {status === "live" && (
             <div style={{ position: "absolute", top: 10, left: 10, background: "#D62828", color: "#fff", fontSize: 10, fontWeight: 800, padding: "4px 9px", borderRadius: 20 }}>
               🔴 LIVE
+            </div>
+          )}
+          {status === "live" && (
+            <div style={{ position: "absolute", top: 10, right: 10, display: "flex", gap: 6 }}>
+              {torchOn !== null && (
+                <button
+                  onClick={handleToggleTorch}
+                  title="Flashlight"
+                  style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: torchOn ? COLORS.willow : "rgba(0,0,0,0.5)", color: "#fff", cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}
+                >
+                  🔦
+                </button>
+              )}
+              <button
+                onClick={handleToggleMic}
+                title={audioOn ? "Mute mic" : "Unmute mic"}
+                style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: audioOn ? "rgba(0,0,0,0.5)" : "#D62828", color: "#fff", cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}
+              >
+                {audioOn ? "🎤" : "🔇"}
+              </button>
             </div>
           )}
           {status !== "live" && (
@@ -533,26 +759,50 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
             </div>
           )}
         </div>
+
+        {status === "live" && cameras.length > 1 && (
+          <select
+            value={activeCameraId}
+            onChange={(e) => handleCameraChange(e.target.value)}
+            style={{ width: "100%", marginBottom: 10, borderRadius: 8, border: "1px solid rgba(255,255,255,0.2)", background: "#111", color: "#fff", padding: "8px 10px", fontSize: 12 }}
+          >
+            {cameras.map((d, i) => (
+              <option key={d.deviceId || i} value={d.deviceId}>{d.label || `Camera ${i + 1}`}</option>
+            ))}
+          </select>
+        )}
+
         {status === "live" && (
-          <div style={{ marginBottom: 14 }}>
+          <div style={{ display: "flex", gap: 8, marginBottom: 6 }}>
             <button
               onClick={() => setShowViewers((v) => !v)}
-              style={{ width: "100%", background: "rgba(255,255,255,0.08)", border: "none", color: "#fff", borderRadius: 10, padding: "9px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "space-between" }}
+              style={{ flex: 1, background: "rgba(255,255,255,0.08)", border: "none", color: "#fff", borderRadius: 10, padding: "9px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
             >
-              <span>👀 {viewers.length} watching</span>
-              <span style={{ fontSize: 11, color: "#B7C4B8" }}>{showViewers ? "Hide ←" : "Show →"}</span>
+              👀 {viewers.length} watching
             </button>
-            {showViewers && (
-              <div style={{ marginTop: 6, background: "rgba(255,255,255,0.05)", borderRadius: 10, padding: viewers.length ? "8px 12px" : "12px", fontSize: 12, color: "#fff" }}>
-                {viewers.length === 0 ? (
-                  <span style={{ color: "#B7C4B8" }}>No one's joined yet.</span>
-                ) : (
-                  viewers.map((v) => <div key={v.id} style={{ padding: "4px 0" }}>{v.name}</div>)
-                )}
-              </div>
+            <button
+              onClick={() => setShowChat((v) => !v)}
+              style={{ flex: 1, background: "rgba(255,255,255,0.08)", border: "none", color: "#fff", borderRadius: 10, padding: "9px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+            >
+              💬 Chat
+            </button>
+          </div>
+        )}
+        {showViewers && (
+          <div style={{ marginBottom: 10, background: "rgba(255,255,255,0.05)", borderRadius: 10, padding: viewers.length ? "8px 12px" : "12px", fontSize: 12, color: "#fff" }}>
+            {viewers.length === 0 ? (
+              <span style={{ color: "#B7C4B8" }}>No one's joined yet.</span>
+            ) : (
+              viewers.map((v) => <div key={v.id} style={{ padding: "4px 0" }}>{v.name}</div>)
             )}
           </div>
         )}
+        {showChat && meetingObj && (
+          <div style={{ marginBottom: 10 }}>
+            <LiveChatPanel meeting={meetingObj} />
+          </div>
+        )}
+
         <div style={{ fontSize: 11, color: "#B7C4B8", textAlign: "center", marginBottom: 14 }}>
           Keep this screen open and your phone unlocked — the broadcast pauses if you switch apps or lock the screen.
         </div>
