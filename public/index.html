@@ -8207,7 +8207,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
   const [showNewForm, setShowNewForm] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
   const [form, setForm] = useState(EMPTY_MATCH_FORM);
-  // Set only by duplicateLastMatch below — the source match to copy the
+  // Set only by duplicateMatch below — the source match to copy the
   // total fee from once the new one's actually created (totalCost isn't a
   // field on this form at all; it's applied straight onto the new match
   // afterward, the same way the banner/QR photos already are).
@@ -8244,33 +8244,36 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
     setDuplicatingFrom(null);
     setShowNewForm(true);
   }
-  // "Last" means whichever match was CREATED most recently (its own
-  // createdAt), not whichever has the latest scheduled date — that's the
-  // one that actually reflects what was set up last time, even if matches
-  // happen to get entered out of order. Everything about who's playing,
-  // paid, or performing never carries over — a new match always starts
-  // with none of that regardless of how it was created; only the setup
-  // fields below do.
-  function duplicateLastMatch() {
-    const last = Object.values(matches || {}).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))[0];
-    if (!last) return;
-    const ownQr = last.hasPaymentQr ? photos[matchQrKey(last.id)] : null;
+  // Called from a specific match's own Settings tab ("Duplicate this
+  // match") rather than always guessing "the most recent one" — the admin
+  // picks which match to reuse as the template. Everything about who's
+  // playing, paid, or performing never carries over — a new match always
+  // starts with none of that regardless of how it was created; only the
+  // setup fields below do.
+  function duplicateMatch(source) {
+    if (!source) return;
+    const ownQr = source.hasPaymentQr ? photos[matchQrKey(source.id)] : null;
     setForm({
       ...EMPTY_MATCH_FORM,
-      matchType: last.matchType || "",
-      groundName: last.groundName || "",
-      time: last.time || "",
-      overs: last.overs || "",
-      ballType: last.ballType || "",
-      jersey: last.jersey || "",
-      locationUrl: last.locationUrl || "",
-      capacity: last.capacity ? String(last.capacity) : "",
-      upiNumber: last.upiNumber || paymentDefault.upiNumber || "",
+      matchType: source.matchType || "",
+      groundName: source.groundName || "",
+      time: source.time || "",
+      overs: source.overs || "",
+      ballType: source.ballType || "",
+      jersey: source.jersey || "",
+      locationUrl: source.locationUrl || "",
+      capacity: source.capacity ? String(source.capacity) : "",
+      upiNumber: source.upiNumber || paymentDefault.upiNumber || "",
       paymentQr: ownQr || paymentDefault.qr || null,
       // date and banner deliberately stay blank — see the plan this came from.
     });
-    setDuplicatingFrom(last);
+    setDuplicatingFrom(source);
     setShowNewForm(true);
+    // The New Match form always renders at the top of this tab — scrolling
+    // there is what actually surfaces it, since the button that triggered
+    // this can be deep inside one match's own expanded Settings tab,
+    // scrolled well below where the form appears.
+    if (typeof window !== "undefined") window.scrollTo({ top: 0, behavior: "smooth" });
   }
 
   function handleCreate() {
@@ -8298,7 +8301,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
     // closed, and the backfill effect picks up the flag either way.
     if (cleaned.banner) uploadMatchBanner(id, cleaned.banner);
     if (cleaned.paymentQr) uploadMatchQr(id, cleaned.paymentQr);
-    // The one field duplicateLastMatch carries over that isn't part of this
+    // The one field duplicateMatch carries over that isn't part of this
     // form at all — applied directly onto the freshly created match.
     if (duplicatingFrom && duplicatingFrom.totalCost) updateMatchField(id, "totalCost", duplicatingFrom.totalCost);
     setForm(EMPTY_MATCH_FORM);
@@ -8315,16 +8318,9 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
       </div>
 
       {!showNewForm ? (
-        <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
-          <button onClick={openNewForm} style={{ flex: 1, background: COLORS.leather, color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-            <Icon size={15}>+</Icon> New match
-          </button>
-          {matchList.length > 0 && (
-            <button onClick={duplicateLastMatch} title="Reuse the ground, time, fee, and other details from your most recently created match" style={{ flex: 1, background: COLORS.card, color: COLORS.willow, border: `1px solid ${COLORS.willow}`, borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-              <Icon size={14}>⎘</Icon> Duplicate last match
-            </button>
-          )}
-        </div>
+        <button onClick={openNewForm} style={{ width: "100%", background: COLORS.leather, color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 600, cursor: "pointer", marginBottom: 18, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+          <Icon size={15}>+</Icon> New match
+        </button>
       ) : (
         <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 18 }}>
           <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12 }}>{duplicatingFrom ? "New match (duplicated)" : "New match"}</div>
@@ -8410,6 +8406,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
               uploadMatchBanner={uploadMatchBanner} removeMatchBanner={removeMatchBanner}
               uploadMatchQr={uploadMatchQr} removeMatchQr={removeMatchQr}
               setMatchPerformerField={setMatchPerformerField} clearMatchPerformer={clearMatchPerformer}
+              onDuplicate={duplicateMatch}
               teamName={teamName}
             />
           ))}
@@ -8419,7 +8416,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
   );
 }
 
-function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpand, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, knownGrounds, knownGroundLocations, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, teamName }) {
+function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpand, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, knownGrounds, knownGroundLocations, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, onDuplicate, teamName }) {
   const [copiedPerformers, setCopiedPerformers] = useState(false);
   async function handleCopyPerformers() {
     const ok = await copyText(buildMatchPerformersMessage(match, players, teamName));
@@ -8443,6 +8440,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
   const [addMode, setAddMode] = useState("available"); // available | notAvailable
   const [guestError, setGuestError] = useState("");
   const [availableExpanded, setAvailableExpanded] = useState(false);
+  const [notAvailableExpanded, setNotAvailableExpanded] = useState(false);
   const [playedExpanded, setPlayedExpanded] = useState(false);
   const [paidExpanded, setPaidExpanded] = useState(false);
   const [viewingProofOf, setViewingProofOf] = useState(null); // player id | null
@@ -8521,17 +8519,37 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
   return (
     <>
     <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, overflow: "hidden" }}>
-      <button onClick={onToggleExpand} style={{ width: "100%", textAlign: "left", background: "transparent", border: "none", cursor: "pointer", padding: 16 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <div>
+      <div style={{ padding: 16 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
+          <div onClick={onToggleExpand} style={{ cursor: "pointer", minWidth: 0, flex: 1 }}>
             <div style={{ fontSize: 14, fontWeight: 600 }}>{match.matchType || "Match"} · {match.groundName || "Ground TBD"}</div>
             <div style={{ fontSize: 12, color: COLORS.inkSoft, marginTop: 2 }}>
               {match.date ? `${dayOfWeekName(match.date)}, ${fmtMatchDate(match.date)}` : "No date set"}{match.time ? ` · ${formatTimeDisplay(match.time)}` : ""}
             </div>
           </div>
-          <Icon size={16} color={COLORS.inkSoft}>{expanded ? "←" : "→"}</Icon>
+          <div style={{ display: "flex", alignItems: "center", gap: 5, flexShrink: 0 }}>
+            {onDuplicate && (
+              <button
+                onClick={() => onDuplicate(match)}
+                title="Duplicate this match — opens a new match form pre-filled with its details"
+                style={{ width: 28, height: 28, borderRadius: 8, border: `1px solid ${COLORS.willow}`, background: "transparent", color: COLORS.willow, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, padding: 0 }}
+              >
+                ⎘
+              </button>
+            )}
+            <button
+              onClick={() => setConfirmDelete(true)}
+              title="Delete this match"
+              style={{ width: 28, height: 28, borderRadius: 8, border: `1px solid ${COLORS.leather}`, background: "transparent", color: COLORS.leather, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, padding: 0 }}
+            >
+              🗑️
+            </button>
+            <button onClick={onToggleExpand} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 4, display: "flex" }}>
+              <Icon size={16} color={COLORS.inkSoft}>{expanded ? "←" : "→"}</Icon>
+            </button>
+          </div>
         </div>
-        <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+        <div onClick={onToggleExpand} style={{ cursor: "pointer", display: "flex", gap: 8, marginTop: 10 }}>
           <span style={{ fontSize: 11, background: "#EEEAD9", color: COLORS.inkSoft, padding: "3px 9px", borderRadius: 20 }}>{availablePlayers.length} available</span>
           {match.totalCost && (
             <span style={{ fontSize: 11, background: allPaid ? "#EAF3E4" : "#FAEEDA", color: allPaid ? "#3B6D11" : "#854F0B", padding: "3px 9px", borderRadius: 20 }}>
@@ -8539,7 +8557,17 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
             </span>
           )}
         </div>
-      </button>
+      </div>
+
+      {confirmDelete && (
+        <div style={{ margin: "0 16px 16px", background: "#FCEBEA", borderRadius: 8, padding: 10 }}>
+          <div style={{ fontSize: 12, color: COLORS.leather, marginBottom: 8 }}>Delete this match and all its data? This can't be undone.</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button onClick={() => setConfirmDelete(false)} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Cancel</button>
+            <button onClick={() => deleteMatch(match.id)} style={{ flex: 1, background: COLORS.leather, color: "#fff", border: "none", borderRadius: 6, padding: "8px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Delete</button>
+          </div>
+        </div>
+      )}
 
       {expanded && (
         <div style={{ padding: "0 16px 16px" }}>
@@ -8715,33 +8743,42 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                   </div>
                 )}
 
-                {notAvailablePlayers.length > 0 && (
-                  <div style={{ marginBottom: 14 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
-                      <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.inkSoft }}>Not Available</span>
-                      <span style={{ fontSize: 10, fontWeight: 700, background: "#F5E1DC", color: "#9A3634", padding: "2px 9px", borderRadius: 20 }}>{notAvailablePlayers.length}</span>
+                {notAvailablePlayers.length > 0 && (() => {
+                  const shownNotAvailable = notAvailableExpanded ? notAvailablePlayers : notAvailablePlayers.slice(0, PREVIEW_ROWS);
+                  const overflow = notAvailablePlayers.length - PREVIEW_ROWS;
+                  return (
+                    <div style={{ marginBottom: 14 }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                        <span style={{ fontSize: 12, fontWeight: 600, color: COLORS.inkSoft }}>Not Available</span>
+                        <span style={{ fontSize: 10, fontWeight: 700, background: "#F5E1DC", color: "#9A3634", padding: "2px 9px", borderRadius: 20 }}>{notAvailablePlayers.length}</span>
+                      </div>
+                      <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                        {shownNotAvailable.map((p) => (
+                          <span key={p.id} style={{
+                            borderRadius: 20, padding: "4px 4px 4px 4px", fontSize: 12,
+                            border: "1px solid #E0A79E", background: "#F5E1DC", color: "#9A3634",
+                            display: "flex", alignItems: "center", gap: 6,
+                          }}>
+                            <PlayerAvatar name={p.name} photo={photos && photos[p.id]} size={20} border={false} onView={photos && photos[p.id] && onViewPhoto ? () => onViewPhoto(p.name, photos[p.id]) : undefined} />
+                            {p.name}
+                            <button
+                              onClick={() => toggleMatchNotAvailable(match.id, p.id)}
+                              title={`Remove ${p.name} from Not Available`}
+                              style={{ width: 16, height: 16, borderRadius: "50%", background: "rgba(0,0,0,0.12)", border: "none", color: "#9A3634", fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", padding: 0, flexShrink: 0 }}
+                            >
+                              ✕
+                            </button>
+                          </span>
+                        ))}
+                      </div>
+                      {overflow > 0 && (
+                        <button onClick={() => setNotAvailableExpanded((v) => !v)} style={{ width: "100%", background: "transparent", border: `1px dashed ${COLORS.line}`, color: COLORS.inkSoft, borderRadius: 8, padding: "8px", fontSize: 12, cursor: "pointer", marginTop: 8 }}>
+                          {notAvailableExpanded ? "Show less" : `Show all ${notAvailablePlayers.length}`}
+                        </button>
+                      )}
                     </div>
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
-                      {notAvailablePlayers.map((p) => (
-                        <span key={p.id} style={{
-                          borderRadius: 20, padding: "4px 4px 4px 4px", fontSize: 12,
-                          border: "1px solid #E0A79E", background: "#F5E1DC", color: "#9A3634",
-                          display: "flex", alignItems: "center", gap: 6,
-                        }}>
-                          <PlayerAvatar name={p.name} photo={photos && photos[p.id]} size={20} border={false} onView={photos && photos[p.id] && onViewPhoto ? () => onViewPhoto(p.name, photos[p.id]) : undefined} />
-                          {p.name}
-                          <button
-                            onClick={() => toggleMatchNotAvailable(match.id, p.id)}
-                            title={`Remove ${p.name} from Not Available`}
-                            style={{ width: 16, height: 16, borderRadius: "50%", background: "rgba(0,0,0,0.12)", border: "none", color: "#9A3634", fontSize: 10, fontWeight: 700, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", padding: 0, flexShrink: 0 }}
-                          >
-                            ✕
-                          </button>
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                  );
+                })()}
 
                 {availablePlayers.length > 0 && (() => {
                   const shown = playedExpanded ? availablePlayers : availablePlayers.slice(0, PREVIEW_ROWS);
@@ -9103,27 +9140,10 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                   banner={matchBanner}
                   onUpload={(dataUrl) => uploadMatchBanner(match.id, dataUrl)}
                   onRemove={() => removeMatchBanner(match.id)}
-                  style={{ marginBottom: 18 }}
                 />
-
-                {allPaid && !confirmDelete && (
-                  <div style={{ background: "#EAF3E4", color: "#3B6D11", borderRadius: 8, padding: "8px 10px", fontSize: 12, marginBottom: 10 }}>
-                    Everyone's paid — you can delete this match now.
-                  </div>
-                )}
-                {!confirmDelete ? (
-                  <button onClick={() => setConfirmDelete(true)} style={{ width: "100%", background: "transparent", border: `1px solid ${COLORS.leather}`, color: COLORS.leather, borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
-                    Delete match
-                  </button>
-                ) : (
-                  <div style={{ background: "#FCEBEA", borderRadius: 8, padding: 10 }}>
-                    <div style={{ fontSize: 12, color: COLORS.leather, marginBottom: 8 }}>Delete this match and all its data? This can't be undone.</div>
-                    <div style={{ display: "flex", gap: 8 }}>
-                      <button onClick={() => setConfirmDelete(false)} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Cancel</button>
-                      <button onClick={() => deleteMatch(match.id)} style={{ flex: 1, background: COLORS.leather, color: "#fff", border: "none", borderRadius: 6, padding: "8px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Delete</button>
-                    </div>
-                  </div>
-                )}
+                {/* Duplicate and Delete moved to the card header, next to the
+                    ground name — visible at a glance instead of needing to
+                    expand into Settings to find them. */}
               </>
             )}
           </MatchTabBar>
