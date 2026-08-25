@@ -8207,6 +8207,11 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
   const [showNewForm, setShowNewForm] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
   const [form, setForm] = useState(EMPTY_MATCH_FORM);
+  // Set only by duplicateLastMatch below — the source match to copy the
+  // total fee from once the new one's actually created (totalCost isn't a
+  // field on this form at all; it's applied straight onto the new match
+  // afterward, the same way the banner/QR photos already are).
+  const [duplicatingFrom, setDuplicatingFrom] = useState(null);
 
   const matchList = Object.values(matches || {}).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   // Every ground this team has ever used, derived from its own match data
@@ -8236,6 +8241,35 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
   // one match afterward, same as any other match field.
   function openNewForm() {
     setForm({ ...EMPTY_MATCH_FORM, upiNumber: paymentDefault.upiNumber || "", paymentQr: paymentDefault.qr || null });
+    setDuplicatingFrom(null);
+    setShowNewForm(true);
+  }
+  // "Last" means whichever match was CREATED most recently (its own
+  // createdAt), not whichever has the latest scheduled date — that's the
+  // one that actually reflects what was set up last time, even if matches
+  // happen to get entered out of order. Everything about who's playing,
+  // paid, or performing never carries over — a new match always starts
+  // with none of that regardless of how it was created; only the setup
+  // fields below do.
+  function duplicateLastMatch() {
+    const last = Object.values(matches || {}).sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""))[0];
+    if (!last) return;
+    const ownQr = last.hasPaymentQr ? photos[matchQrKey(last.id)] : null;
+    setForm({
+      ...EMPTY_MATCH_FORM,
+      matchType: last.matchType || "",
+      groundName: last.groundName || "",
+      time: last.time || "",
+      overs: last.overs || "",
+      ballType: last.ballType || "",
+      jersey: last.jersey || "",
+      locationUrl: last.locationUrl || "",
+      capacity: last.capacity ? String(last.capacity) : "",
+      upiNumber: last.upiNumber || paymentDefault.upiNumber || "",
+      paymentQr: ownQr || paymentDefault.qr || null,
+      // date and banner deliberately stay blank — see the plan this came from.
+    });
+    setDuplicatingFrom(last);
     setShowNewForm(true);
   }
 
@@ -8264,7 +8298,11 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
     // closed, and the backfill effect picks up the flag either way.
     if (cleaned.banner) uploadMatchBanner(id, cleaned.banner);
     if (cleaned.paymentQr) uploadMatchQr(id, cleaned.paymentQr);
+    // The one field duplicateLastMatch carries over that isn't part of this
+    // form at all — applied directly onto the freshly created match.
+    if (duplicatingFrom && duplicatingFrom.totalCost) updateMatchField(id, "totalCost", duplicatingFrom.totalCost);
     setForm(EMPTY_MATCH_FORM);
+    setDuplicatingFrom(null);
     setShowNewForm(false);
     setExpandedId(id);
   }
@@ -8277,12 +8315,24 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
       </div>
 
       {!showNewForm ? (
-        <button onClick={openNewForm} style={{ width: "100%", background: COLORS.leather, color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 600, cursor: "pointer", marginBottom: 18, display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
-          <Icon size={15}>+</Icon> New match
-        </button>
+        <div style={{ display: "flex", gap: 8, marginBottom: 18 }}>
+          <button onClick={openNewForm} style={{ flex: 1, background: COLORS.leather, color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+            <Icon size={15}>+</Icon> New match
+          </button>
+          {matchList.length > 0 && (
+            <button onClick={duplicateLastMatch} title="Reuse the ground, time, fee, and other details from your most recently created match" style={{ flex: 1, background: COLORS.card, color: COLORS.willow, border: `1px solid ${COLORS.willow}`, borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+              <Icon size={14}>⎘</Icon> Duplicate last match
+            </button>
+          )}
+        </div>
       ) : (
         <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 18 }}>
-          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12 }}>New match</div>
+          <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 12 }}>{duplicatingFrom ? "New match (duplicated)" : "New match"}</div>
+          {duplicatingFrom && (
+            <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 10.5, color: "#3B6D11", background: "#EAF3E4", borderRadius: 8, padding: "6px 10px", marginBottom: 10 }}>
+              <Icon size={11}>✓</Icon> Filled in from {cleanField(duplicatingFrom.groundName, "your last match")} — just pick a new date below.
+            </div>
+          )}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
             <FieldSelect placeholder="Match type" value={form.matchType} onChange={(v) => setForm({ ...form, matchType: v })} options={MATCH_TYPE_OPTIONS} />
             <GroundNameField
@@ -8337,7 +8387,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
             <input placeholder="UPI / phone number for payment" value={form.upiNumber} onChange={(e) => setForm({ ...form, upiNumber: e.target.value })} style={{ ...inputStyle, flex: 1 }} />
           </div>
           <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={() => setShowNewForm(false)} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "10px", fontSize: 13, cursor: "pointer" }}>Cancel</button>
+            <button onClick={() => { setShowNewForm(false); setDuplicatingFrom(null); }} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "10px", fontSize: 13, cursor: "pointer" }}>Cancel</button>
             <button onClick={handleCreate} style={{ flex: 1, background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 13, fontWeight: 600, cursor: "pointer" }}>Create match</button>
           </div>
         </div>
