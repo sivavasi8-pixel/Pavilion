@@ -551,10 +551,26 @@ function matchBannerKey(matchId) {
 function matchQrKey(matchId) {
   return `qr_${matchId}`;
 }
-// Same pattern again for a Gear Exchange listing's optional photo — its
+// Same pattern again for a Gear Exchange listing's photos — each one its
 // own small photo_ document rather than living inline on the listing.
+// marketplacePhotoKey (no photoId) is the OLD single-photo key format,
+// kept only so listings posted before multi-photo existed keep reading
+// correctly; every listing since then uses marketplacePhotoKeyN instead.
 function marketplacePhotoKey(id) {
   return `marketplace_${id}`;
+}
+function marketplacePhotoKeyN(id, photoId) {
+  return `marketplace_${id}_${photoId}`;
+}
+// The ordered list of photo keys for a listing, whichever shape it's in —
+// callers never need to know or care whether this is an old single-photo
+// listing or a new multi-photo one.
+function marketplacePhotoKeys(listing) {
+  if (listing.photoIds && listing.photoIds.length > 0) {
+    return listing.photoIds.map((pid) => marketplacePhotoKeyN(listing.id, pid));
+  }
+  if (listing.hasPhoto) return [marketplacePhotoKey(listing.id)];
+  return [];
 }
 // WhatsApp messages are read on phones far more than desktops, and a chat
 // bubble is nowhere near wide enough for a padded/aligned "table" (36
@@ -564,6 +580,14 @@ function marketplacePhotoKey(id) {
 // column to break, so even a wrapped line just reads like a wrapped
 // sentence. See the conversation this replaced padRow() from for the
 // screenshots that showed the old table-style formatting breaking down.
+// Ball's dropdown only ever offers these two values — a plain lookup is
+// enough, with a neutral fallback for older/unset data rather than a
+// third real case to design for.
+function ballTypeIcon(ballType) {
+  if (ballType === "Leather Red") return "🔴";
+  if (ballType === "Leather White") return "⚪";
+  return "🏏";
+}
 function buildMatchAvailabilityMessage(match, players) {
   const availablePlayers = (match.available || []).map((id) => players.find((p) => p.id === id)).filter(Boolean);
   const notAvailablePlayers = (match.notAvailable || []).map((id) => players.find((p) => p.id === id)).filter(Boolean);
@@ -573,12 +597,12 @@ function buildMatchAvailabilityMessage(match, players) {
   out.push("");
   out.push("Hi Team, please confirm your availability:");
   out.push("");
-  out.push(`Day: ${dayOfWeekName(match.date) || "-"}`);
-  out.push(`Date: ${match.date ? fmtMatchDate(match.date) : "-"}`);
-  out.push(`Time: ${cleanField(formatTimeDisplay(match.time), "-")}`);
-  out.push(`Overs: ${cleanField(match.overs, "-")}`);
-  out.push(`Ball: ${cleanField(match.ballType, "-")}`);
-  out.push(`Jersey: ${cleanField(match.jersey, "-")}`);
+  out.push(`📆 Day: ${dayOfWeekName(match.date) || "-"}`);
+  out.push(`📅 Date: ${match.date ? fmtMatchDate(match.date) : "-"}`);
+  out.push(`⏰ Time: ${cleanField(formatTimeDisplay(match.time), "-")}`);
+  out.push(`🏏 Overs: ${cleanField(match.overs, "-")}`);
+  out.push(`${ballTypeIcon(match.ballType)} Ball: ${cleanField(match.ballType, "-")}`);
+  out.push(`👕 Jersey: ${cleanField(match.jersey, "-")}`);
   if (match.locationUrl) {
     out.push("");
     out.push(`📍 Location: ${cleanField(match.locationUrl)}`);
@@ -890,8 +914,8 @@ function buildMarketplaceMessage(listing, players, teamName) {
   out.push(cleanField(listing.title, "Untitled"));
   if (listing.description && listing.description.trim()) out.push(listing.description.trim());
   const priceRange = fmtMarketplacePriceRange(listing.priceMin, listing.priceMax);
-  if (priceRange) out.push(`${listing.type === "want" ? "Budget" : "Asking"}: ${priceRange}`);
-  if (listing.type === "sell" && listing.condition) out.push(`Condition: ${listing.condition}`);
+  if (priceRange) out.push(`💰 ${listing.type === "want" ? "Budget" : "Asking"}: ${priceRange}`);
+  if (listing.type === "sell" && listing.condition) out.push(`🏷️ Condition: ${listing.condition}`);
   out.push("");
   out.push(`Posted by ${poster} — reply here or reach out directly if interested.`);
   return out.join("\n");
@@ -913,7 +937,7 @@ function buildMatchPaymentMessage(match, players, paymentDefault, payCardUrl) {
   // used to be the only message that left out which match it was even
   // about, easy to mix up once more than one is in flight.
   out.push(`📍 ${cleanField(match.groundName, "Ground TBD")}`);
-  out.push(`${dayOfWeekName(match.date) || "-"}, ${match.date ? fmtMatchDate(match.date) : "-"}`);
+  out.push(`📅 ${dayOfWeekName(match.date) || "-"}, ${match.date ? fmtMatchDate(match.date) : "-"}`);
   out.push("");
   if (payCardUrl) {
     out.push(`Team, please pay ${fmtINR(perPlayerFee)} and update as paid against your name. Tap below to pay via UPI:`);
@@ -2395,7 +2419,7 @@ function CricketNetsTracker() {
     let cancelled = false;
     (async () => {
       for (const l of expired) {
-        if (l.hasPhoto) await window.storage.delete(`photo_${marketplacePhotoKey(l.id)}`);
+        for (const photoKey of marketplacePhotoKeys(l)) await window.storage.delete(`photo_${photoKey}`);
       }
       if (cancelled) return;
       setMarketplace((prev) => {
@@ -2405,7 +2429,7 @@ function CricketNetsTracker() {
       });
       setPhotos((prev) => {
         const next = { ...prev };
-        expired.forEach((l) => { if (l.hasPhoto) delete next[marketplacePhotoKey(l.id)]; });
+        expired.forEach((l) => { marketplacePhotoKeys(l).forEach((k) => { delete next[k]; }); });
         return next;
       });
     })();
@@ -3489,6 +3513,36 @@ function CricketNetsTracker() {
       return { ...prev, [matchId]: { ...m, available: Array.from(available), notAvailable: Array.from(notAvailable), waitlist } };
     });
   }
+  // Mirror of adminAddAvailable above, for the other direction — admin
+  // recording that someone said they can't make it (verbally, or in the
+  // WhatsApp thread) without them tapping Not Available themselves. Same
+  // silent, no-broadcast treatment (this isn't a real vote), but still
+  // promotes the next waitlisted player and clears any carpool entry, the
+  // same real side effects a genuine Not Available vote would trigger —
+  // those affect other people regardless of how the change happened.
+  function adminAddNotAvailable(matchId, playerId) {
+    let promotedId = null;
+    let leftDriverId = null;
+    setMatches((prev) => {
+      const m = prev[matchId];
+      if (!m) return prev;
+      const available = new Set(m.available || []);
+      const notAvailable = new Set(m.notAvailable || []);
+      let waitlist = (m.waitlist || []).filter((id) => id !== playerId);
+      const wasAvailable = available.has(playerId);
+      available.delete(playerId);
+      notAvailable.add(playerId);
+      if (wasAvailable && waitlist.length > 0) { promotedId = waitlist.shift(); available.add(promotedId); }
+      const before = m.carpool || {};
+      if (!available.has(playerId) && before[playerId] && before[playerId].role === "rider" && before[playerId].joinedDriverId) {
+        leftDriverId = before[playerId].joinedDriverId;
+      }
+      const carpool = available.has(playerId) ? before : clearCarpoolEntry(before, playerId);
+      return { ...prev, [matchId]: { ...m, available: Array.from(available), notAvailable: Array.from(notAvailable), waitlist, carpool } };
+    });
+    if (promotedId) notifyPromoted(promotedId);
+    if (leftDriverId && matches[matchId]) notifyCarpoolLeft(leftDriverId, playerId, matches[matchId]);
+  }
   // Manually jumping someone up the waitlist out of order — also an admin
   // override, so it isn't blocked by capacity either.
   function promoteFromWaitlist(matchId, playerId) {
@@ -3757,8 +3811,12 @@ function CricketNetsTracker() {
 
   // posterId is null when the admin posts on the team's own behalf (e.g.
   // selling old club kit) — there's no player record to attribute it to.
+  // fields.photos is an array of up to 4 data URLs — same shape whether
+  // this is a brand-new post or the pre-filled result of editing one.
   function postMarketplaceListing(fields, posterId) {
     const id = `mkt_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    const photoList = (fields.photos || []).filter(Boolean).slice(0, 4);
+    const photoIds = photoList.map(() => Math.random().toString(36).slice(2, 8));
     const listing = {
       id,
       type: fields.type === "want" ? "want" : "sell",
@@ -3773,17 +3831,61 @@ function CricketNetsTracker() {
       status: "active",
       closedAt: null,
       interested: [],
-      hasPhoto: !!fields.photoDataUrl,
+      photoIds,
     };
     setMarketplace((prev) => ({ ...prev, [id]: listing }));
-    if (fields.photoDataUrl) {
-      const photoKey = marketplacePhotoKey(id);
-      window.storage.set(`photo_${photoKey}`, fields.photoDataUrl).then((res) => {
-        if (res) setPhotos((prev) => ({ ...prev, [photoKey]: fields.photoDataUrl }));
+    photoList.forEach((dataUrl, i) => {
+      const photoKey = marketplacePhotoKeyN(id, photoIds[i]);
+      window.storage.set(`photo_${photoKey}`, dataUrl).then((res) => {
+        if (res) setPhotos((prev) => ({ ...prev, [photoKey]: dataUrl }));
       });
-    }
+    });
     notifyNewMarketplaceListing(listing);
     return id;
+  }
+  // Editing doesn't try to diff which photos changed — it wipes every
+  // photo doc this listing had (old single-photo format or new multi-photo
+  // format, whichever it was) and writes fresh ones for whatever the
+  // edited photo list ends up being. A few extra writes on an infrequent
+  // action, in exchange for never needing two different diffing paths for
+  // two historical key formats. Also the one place an old listing fully
+  // migrates off the legacy hasPhoto key, the moment it's next edited.
+  async function updateMarketplaceListing(id, fields) {
+    const current = marketplace[id];
+    if (!current) return;
+    const oldKeys = marketplacePhotoKeys(current);
+    await Promise.all(oldKeys.map((k) => window.storage.delete(`photo_${k}`)));
+
+    const photoList = (fields.photos || []).filter(Boolean).slice(0, 4);
+    const photoIds = photoList.map(() => Math.random().toString(36).slice(2, 8));
+    await Promise.all(photoList.map((dataUrl, i) =>
+      window.storage.set(`photo_${marketplacePhotoKeyN(id, photoIds[i])}`, dataUrl)
+    ));
+
+    setPhotos((prev) => {
+      const next = { ...prev };
+      oldKeys.forEach((k) => { delete next[k]; });
+      photoList.forEach((dataUrl, i) => { next[marketplacePhotoKeyN(id, photoIds[i])] = dataUrl; });
+      return next;
+    });
+    setMarketplace((prev) => {
+      if (!prev[id]) return prev;
+      return {
+        ...prev,
+        [id]: {
+          ...prev[id],
+          type: fields.type === "want" ? "want" : "sell",
+          category: fields.category || "Other",
+          title: (fields.title || "").trim(),
+          description: (fields.description || "").trim(),
+          condition: fields.type === "sell" ? (fields.condition || "") : "",
+          priceMin: fields.priceMin || "",
+          priceMax: fields.priceMax || "",
+          photoIds,
+          hasPhoto: false,
+        },
+      };
+    });
   }
   // Closing (not deleting) is what the poster does themselves once it's
   // sold/found — see the auto-clear effect below for what eventually
@@ -3794,16 +3896,22 @@ function CricketNetsTracker() {
       return { ...prev, [id]: { ...prev[id], status: "closed", closedAt: new Date().toISOString() } };
     });
   }
-  // Admin-only in the UI (moderation) — removes the listing and its photo
-  // outright, unlike closeMarketplaceListing above.
+  // Available to admin (moderation, any listing) and to the poster
+  // themselves (their own listing only, enforced in the UI) — removes the
+  // listing and every one of its photos outright, unlike
+  // closeMarketplaceListing above.
   async function deleteMarketplaceListing(id) {
     const listing = marketplace[id];
     setMarketplace((prev) => { const next = { ...prev }; delete next[id]; return next; });
-    if (listing && listing.hasPhoto) {
-      const photoKey = marketplacePhotoKey(id);
-      await window.storage.delete(`photo_${photoKey}`);
-      setPhotos((prev) => { const next = { ...prev }; delete next[photoKey]; return next; });
-    }
+    if (!listing) return;
+    const keys = marketplacePhotoKeys(listing);
+    if (keys.length === 0) return;
+    await Promise.all(keys.map((k) => window.storage.delete(`photo_${k}`)));
+    setPhotos((prev) => {
+      const next = { ...prev };
+      keys.forEach((k) => { delete next[k]; });
+      return next;
+    });
   }
   function toggleMarketplaceInterest(id, playerId) {
     let becameInterested = false;
@@ -3994,8 +4102,10 @@ function CricketNetsTracker() {
           submitPlayerPinResetRequest={submitPlayerPinResetRequest}
           marketplace={marketplace}
           postMarketplaceListing={postMarketplaceListing}
+          updateMarketplaceListing={updateMarketplaceListing}
           toggleMarketplaceInterest={toggleMarketplaceInterest}
           closeMarketplaceListing={closeMarketplaceListing}
+          deleteMarketplaceListing={deleteMarketplaceListing}
         />
       )}
 
@@ -4129,7 +4239,7 @@ function CricketNetsTracker() {
                 addMatch={addMatch} updateMatchField={updateMatchField}
                 toggleMatchAvailable={toggleMatchAvailable} toggleMatchNotAvailable={toggleMatchNotAvailable} togglePlayed={togglePlayed}
                 toggleMatchPaid={toggleMatchPaid} deleteMatch={deleteMatch}
-                updateMatchCapacity={updateMatchCapacity} adminAddAvailable={adminAddAvailable}
+                updateMatchCapacity={updateMatchCapacity} adminAddAvailable={adminAddAvailable} adminAddNotAvailable={adminAddNotAvailable}
                 promoteFromWaitlist={promoteFromWaitlist} addGuestPlayer={addGuestPlayer}
                 paymentDefault={paymentDefault}
                 uploadMatchBanner={uploadMatchBanner} removeMatchBanner={removeMatchBanner}
@@ -4144,6 +4254,7 @@ function CricketNetsTracker() {
                 isAdmin={true} viewerId={null}
                 teamName={teamRecord ? teamRecord.teamName : ""}
                 onPost={(fields) => postMarketplaceListing(fields, null)}
+                onUpdate={updateMarketplaceListing}
                 onToggleInterest={() => {}}
                 onClose={closeMarketplaceListing}
                 onDelete={deleteMarketplaceListing}
@@ -5213,7 +5324,7 @@ function HighlightClipCard({ player, setPlayerVideo, removePlayerVideo, onView }
   );
 }
 
-function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing }) {
+function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, updateMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing, deleteMarketplaceListing }) {
   const [selectedId, setSelectedId] = useState(() => (
     initialSelectedId && players.some((p) => p.id === initialSelectedId) ? initialSelectedId : ""
   ));
@@ -5567,9 +5678,10 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
               isAdmin={false} viewerId={authedPlayer.id}
               teamName={teamRecord ? teamRecord.teamName : ""}
               onPost={(fields) => postMarketplaceListing(fields, authedPlayer.id)}
+              onUpdate={updateMarketplaceListing}
               onToggleInterest={toggleMarketplaceInterest}
               onClose={closeMarketplaceListing}
-              onDelete={() => {}}
+              onDelete={deleteMarketplaceListing}
               onViewPhoto={openPhoto}
             />
           )}
@@ -7631,7 +7743,8 @@ const JERSEY_OPTIONS = ["Whites", "Color"];
 const SEAT_COUNT_OPTIONS = ["1", "2", "3", "4", "5", "6", "7", "8"];
 const GEAR_CATEGORIES = ["Bat", "Pads", "Gloves", "Helmet", "Shoes", "Kit Bag", "Ball", "Other"];
 const GEAR_CATEGORY_ICON = { Bat: "🏏", Pads: "🦵", Gloves: "🧤", Helmet: "⛑️", Shoes: "👟", "Kit Bag": "🎒", Ball: "⚪", Other: "📦" };
-const EMPTY_LISTING_FORM = { type: "sell", category: "", title: "", description: "", condition: "", priceMin: "", priceMax: "", photoDataUrl: null };
+const EMPTY_LISTING_FORM = { type: "sell", category: "", title: "", description: "", condition: "", priceMin: "", priceMax: "", photos: [] };
+const MARKETPLACE_MAX_PHOTOS = 4;
 
 // A plain <select> with a blank first option, so the field stays optional
 // exactly like the free-text input it replaces — nothing downstream reads
@@ -7787,13 +7900,17 @@ function DobField({ value, onChange, onBlur, maxDate, dark, compact }) {
 // between the admin and player sides via `isAdmin` rather than two
 // separate near-identical components, since the feed itself is the same
 // either way and only a couple of per-card actions actually differ.
-function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamName, onPost, onToggleInterest, onClose, onDelete, onViewPhoto }) {
+function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamName, onPost, onUpdate, onToggleInterest, onClose, onDelete, onViewPhoto }) {
   const [filter, setFilter] = useState("all"); // all | sell | want | mine
   const [showForm, setShowForm] = useState(false);
   const [form, setForm] = useState(EMPTY_LISTING_FORM);
   const [formError, setFormError] = useState("");
   const [posting, setPosting] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
+  // Set while editing an existing listing (its id) — null while posting a
+  // brand-new one. Same form either way; this just decides whether
+  // handleSubmit calls onPost or onUpdate.
+  const [editingId, setEditingId] = useState(null);
 
   const allListings = Object.values(marketplace || {}).sort((a, b) => (b.postedAt || "").localeCompare(a.postedAt || ""));
   const listings = allListings.filter((l) => {
@@ -7808,15 +7925,36 @@ function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamN
   function updateForm(field, value) {
     setForm((prev) => ({ ...prev, [field]: value }));
   }
+  function closeForm() {
+    setShowForm(false);
+    setEditingId(null);
+    setForm(EMPTY_LISTING_FORM);
+    setFormError("");
+  }
+  // Pre-fills the same form used to post a new listing, from the listing's
+  // current fields and whichever photos it actually has (old single-photo
+  // format or new multi-photo format — marketplacePhotoKeys hides that
+  // difference already).
+  function startEdit(listing) {
+    const existingPhotos = marketplacePhotoKeys(listing).map((k) => photos[k]).filter(Boolean);
+    setForm({
+      type: listing.type, category: listing.category, title: listing.title, description: listing.description,
+      condition: listing.condition || "", priceMin: listing.priceMin || "", priceMax: listing.priceMax || "",
+      photos: existingPhotos,
+    });
+    setEditingId(listing.id);
+    setFormError("");
+    setShowForm(true);
+  }
   async function handleSubmit() {
     setFormError("");
     if (!form.title.trim()) { setFormError("Give it a short title."); return; }
     if (!form.category) { setFormError("Pick a category."); return; }
     setPosting(true);
-    await onPost(form);
+    if (editingId) await onUpdate(editingId, form);
+    else await onPost(form);
     setPosting(false);
-    setForm(EMPTY_LISTING_FORM);
-    setShowForm(false);
+    closeForm();
   }
 
   const FILTERS = [["all", "All"], ["sell", "For Sale"], ["want", "Wanted"], ["mine", "Mine"]];
@@ -7825,13 +7963,14 @@ function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamN
     <div>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10, marginBottom: 14 }}>
         <div style={{ fontSize: 12.5, color: COLORS.inkSoft }}>Buy, sell, or ask around for cricket gear.</div>
-        <button onClick={() => setShowForm((v) => !v)} style={{ flexShrink: 0, background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
+        <button onClick={() => (showForm ? closeForm() : setShowForm(true))} style={{ flexShrink: 0, background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 14px", fontSize: 12.5, fontWeight: 600, cursor: "pointer" }}>
           {showForm ? "Cancel" : "+ Post"}
         </button>
       </div>
 
       {showForm && (
         <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 16 }}>
+          {editingId && <div style={{ fontSize: 11, fontWeight: 700, color: COLORS.willow, textTransform: "uppercase", letterSpacing: 0.5, marginBottom: 10 }}>Editing listing</div>}
           <div style={{ display: "flex", gap: 8, marginBottom: 10 }}>
             <button
               onClick={() => updateForm("type", "sell")} className="chip"
@@ -7878,17 +8017,32 @@ function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamN
               onChange={(e) => updateForm("priceMax", sanitizeDecimalInput(e.target.value))} style={inputStyle}
             />
           </div>
-          <PlainImageUpload maxDim={800} quality={0.78} onUpload={(dataUrl) => updateForm("photoDataUrl", dataUrl)}>
-            {(busy) => (
-              <div style={{ border: `1.5px dashed ${COLORS.line}`, borderRadius: 10, padding: 12, textAlign: "center", cursor: "pointer", background: "#fff", marginBottom: 10, display: "flex", alignItems: "center", justifyContent: "center", gap: 10 }}>
-                {form.photoDataUrl && <img src={form.photoDataUrl} alt="" style={{ width: 44, height: 44, objectFit: "cover", borderRadius: 8 }} />}
-                <div style={{ fontSize: 11.5, color: COLORS.inkSoft }}>{busy ? "Uploading…" : form.photoDataUrl ? "Tap to replace photo" : "+ Add a photo (optional)"}</div>
+          <div style={{ display: "flex", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
+            {form.photos.map((dataUrl, i) => (
+              <div key={i} style={{ width: 56, height: 56, borderRadius: 8, overflow: "hidden", position: "relative", flexShrink: 0 }}>
+                <img src={dataUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                <button
+                  onClick={() => updateForm("photos", form.photos.filter((_, idx) => idx !== i))}
+                  style={{ position: "absolute", top: 2, right: 2, width: 16, height: 16, borderRadius: "50%", background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", fontSize: 9, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}
+                >
+                  ✕
+                </button>
               </div>
+            ))}
+            {form.photos.length < MARKETPLACE_MAX_PHOTOS && (
+              <PlainImageUpload maxDim={800} quality={0.78} onUpload={(dataUrl) => updateForm("photos", [...form.photos, dataUrl])}>
+                {(busy) => (
+                  <div style={{ width: 56, height: 56, borderRadius: 8, border: `1.5px dashed ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", fontSize: 18, color: COLORS.inkSoft, flexShrink: 0 }}>
+                    {busy ? "…" : "+"}
+                  </div>
+                )}
+              </PlainImageUpload>
             )}
-          </PlainImageUpload>
+          </div>
+          <div style={{ fontSize: 10.5, color: COLORS.inkSoft, marginBottom: 10 }}>{form.photos.length} of {MARKETPLACE_MAX_PHOTOS} photos (optional)</div>
           {formError && <div style={{ background: "#FCEBEA", color: COLORS.leather, borderRadius: 8, padding: "8px 12px", fontSize: 11.5, marginBottom: 8 }}>{formError}</div>}
           <button onClick={handleSubmit} disabled={posting} style={{ width: "100%", background: COLORS.pitch, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 13, fontWeight: 600, cursor: posting ? "default" : "pointer", opacity: posting ? 0.7 : 1 }}>
-            {posting ? "Posting…" : "Post"}
+            {posting ? "Saving…" : editingId ? "Save changes" : "Post"}
           </button>
         </div>
       )}
@@ -7913,9 +8067,9 @@ function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamN
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {listings.map((l) => (
             <MarketplaceListingCard
-              key={l.id} listing={l} photo={photos[marketplacePhotoKey(l.id)]} players={players} photos={photos} teamName={teamName}
+              key={l.id} listing={l} photoList={marketplacePhotoKeys(l).map((k) => photos[k]).filter(Boolean)} players={players} photos={photos} teamName={teamName}
               isAdmin={isAdmin} viewerId={viewerId} expanded={expandedId === l.id} onToggleExpand={() => setExpandedId(expandedId === l.id ? null : l.id)}
-              onToggleInterest={onToggleInterest} onClose={onClose} onDelete={onDelete} onViewPhoto={onViewPhoto}
+              onToggleInterest={onToggleInterest} onClose={onClose} onDelete={onDelete} onEdit={startEdit} onViewPhoto={onViewPhoto}
             />
           ))}
         </div>
@@ -7924,13 +8078,16 @@ function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamN
   );
 }
 
-function MarketplaceListingCard({ listing, photo, players, photos, teamName, isAdmin, viewerId, expanded, onToggleExpand, onToggleInterest, onClose, onDelete, onViewPhoto }) {
+function MarketplaceListingCard({ listing, photoList, players, photos, teamName, isAdmin, viewerId, expanded, onToggleExpand, onToggleInterest, onClose, onDelete, onEdit, onViewPhoto }) {
   const [copied, setCopied] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const posterName = marketplacePosterName(listing, players, teamName);
   const priceRange = fmtMarketplacePriceRange(listing.priceMin, listing.priceMax);
   const isMine = isAdmin ? listing.posterId === null : listing.posterId === viewerId;
   const iAmInterested = !isAdmin && (listing.interested || []).includes(viewerId);
   const interestedPlayers = (listing.interested || []).map((id) => players.find((p) => p.id === id)).filter(Boolean);
+  const canDelete = isAdmin || isMine;
+  const coverPhoto = photoList[0];
 
   async function handleCopy() {
     const ok = await copyText(buildMarketplaceMessage(listing, players, teamName));
@@ -7942,7 +8099,7 @@ function MarketplaceListingCard({ listing, photo, players, photos, teamName, isA
     <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, overflow: "hidden", opacity: listing.status === "closed" ? 0.65 : 1 }}>
       <button onClick={onToggleExpand} style={{ width: "100%", textAlign: "left", background: "transparent", border: "none", cursor: "pointer", padding: 14, display: "flex", gap: 10 }}>
         <div style={{ width: 44, height: 44, borderRadius: 8, overflow: "hidden", flexShrink: 0, background: "#E4C79A", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 20 }}>
-          {photo ? <img src={photo} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : (GEAR_CATEGORY_ICON[listing.category] || "📦")}
+          {coverPhoto ? <img src={coverPhoto} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} /> : (GEAR_CATEGORY_ICON[listing.category] || "📦")}
         </div>
         <div style={{ flex: 1, minWidth: 0 }}>
           <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
@@ -7963,11 +8120,15 @@ function MarketplaceListingCard({ listing, photo, players, photos, teamName, isA
       {expanded && (
         <div style={{ padding: "0 14px 14px" }}>
           {listing.description && <div style={{ fontSize: 12.5, color: COLORS.ink, marginBottom: 10, whiteSpace: "pre-wrap" }}>{listing.description}</div>}
-          {photo && (
-            <img
-              src={photo} alt={listing.title} onClick={() => onViewPhoto(listing.title, photo, true)}
-              style={{ width: "100%", maxHeight: 200, objectFit: "cover", borderRadius: 10, marginBottom: 10, cursor: "pointer" }}
-            />
+          {photoList.length > 0 && (
+            <div style={{ display: "flex", gap: 8, overflowX: "auto", marginBottom: 10, paddingBottom: 2 }}>
+              {photoList.map((p, i) => (
+                <img
+                  key={i} src={p} alt={listing.title} onClick={() => onViewPhoto(listing.title, p, true)}
+                  style={{ width: photoList.length > 1 ? 140 : "100%", maxHeight: 200, height: 200, objectFit: "cover", borderRadius: 10, cursor: "pointer", flexShrink: 0 }}
+                />
+              ))}
+            </div>
           )}
 
           {interestedPlayers.length > 0 && (
@@ -8000,21 +8161,39 @@ function MarketplaceListingCard({ listing, photo, players, photos, teamName, isA
           )}
 
           {isMine && listing.status === "active" && (
-            <button
-              onClick={() => onClose(listing.id)}
-              style={{ width: "100%", marginTop: 8, cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.inkSoft }}
-            >
-              Mark as {listing.type === "want" ? "Found" : "Sold"}
-            </button>
+            <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+              <button
+                onClick={() => onEdit(listing)}
+                style={{ flex: 1, cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${COLORS.willow}`, background: "transparent", color: COLORS.willow }}
+              >
+                ✏️ Edit
+              </button>
+              <button
+                onClick={() => onClose(listing.id)}
+                style={{ flex: 1, cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${COLORS.line}`, background: "transparent", color: COLORS.inkSoft }}
+              >
+                Mark as {listing.type === "want" ? "Found" : "Sold"}
+              </button>
+            </div>
           )}
 
-          {isAdmin && (
-            <button
-              onClick={() => onDelete(listing.id)}
-              style={{ width: "100%", marginTop: 8, cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${COLORS.leather}`, background: "transparent", color: COLORS.leather }}
-            >
-              Delete listing
-            </button>
+          {canDelete && (
+            confirmDelete ? (
+              <div style={{ background: "#FCEBEA", borderRadius: 8, padding: 10, marginTop: 8 }}>
+                <div style={{ fontSize: 12, color: COLORS.leather, marginBottom: 8 }}>Delete this listing? This can't be undone.</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={() => setConfirmDelete(false)} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Cancel</button>
+                  <button onClick={() => onDelete(listing.id)} style={{ flex: 1, background: COLORS.leather, color: "#fff", border: "none", borderRadius: 6, padding: "8px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Delete</button>
+                </div>
+              </div>
+            ) : (
+              <button
+                onClick={() => setConfirmDelete(true)}
+                style={{ width: "100%", marginTop: 8, cursor: "pointer", borderRadius: 8, padding: "9px", fontSize: 12.5, fontWeight: 600, border: `1px solid ${COLORS.leather}`, background: "transparent", color: COLORS.leather }}
+              >
+                🗑️ Delete listing
+              </button>
+            )
           )}
         </div>
       )}
@@ -8024,7 +8203,7 @@ function MarketplaceListingCard({ listing, photo, players, photos, teamName, isA
 
 const EMPTY_MATCH_FORM = { matchType: "", groundName: "", date: "", time: "", overs: "", ballType: "", jersey: "", locationUrl: "", capacity: "", upiNumber: "", paymentQr: null, banner: null };
 
-function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, teamName }) {
+function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, teamName }) {
   const [showNewForm, setShowNewForm] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
   const [form, setForm] = useState(EMPTY_MATCH_FORM);
@@ -8175,7 +8354,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
               onToggleExpand={() => setExpandedId(expandedId === m.id ? null : m.id)}
               updateMatchField={updateMatchField} toggleMatchAvailable={toggleMatchAvailable} toggleMatchNotAvailable={toggleMatchNotAvailable}
               togglePlayed={togglePlayed} toggleMatchPaid={toggleMatchPaid} deleteMatch={deleteMatch}
-              updateMatchCapacity={updateMatchCapacity} adminAddAvailable={adminAddAvailable}
+              updateMatchCapacity={updateMatchCapacity} adminAddAvailable={adminAddAvailable} adminAddNotAvailable={adminAddNotAvailable}
               promoteFromWaitlist={promoteFromWaitlist} addGuestPlayer={addGuestPlayer}
               paymentDefault={paymentDefault} knownGrounds={knownGrounds} knownGroundLocations={knownGroundLocations}
               uploadMatchBanner={uploadMatchBanner} removeMatchBanner={removeMatchBanner}
@@ -8190,7 +8369,7 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
   );
 }
 
-function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpand, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, knownGrounds, knownGroundLocations, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, teamName }) {
+function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpand, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, knownGrounds, knownGroundLocations, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, teamName }) {
   const [copiedPerformers, setCopiedPerformers] = useState(false);
   async function handleCopyPerformers() {
     const ok = await copyText(buildMatchPerformersMessage(match, players, teamName));
@@ -8208,6 +8387,10 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showAddAvailable, setShowAddAvailable] = useState(false);
   const [addSearchQuery, setAddSearchQuery] = useState("");
+  // Which list the "add someone verbally" panel below adds into — kept
+  // separate from the panel's open/closed state so switching between
+  // Available and Not Available doesn't reset the search someone's mid-typing.
+  const [addMode, setAddMode] = useState("available"); // available | notAvailable
   const [guestError, setGuestError] = useState("");
   const [availableExpanded, setAvailableExpanded] = useState(false);
   const [playedExpanded, setPlayedExpanded] = useState(false);
@@ -8370,6 +8553,30 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                     <div style={{ fontSize: 10.5, color: COLORS.inkSoft, marginBottom: 6 }}>
                       This is the only way to add someone here without them signing in themselves.
                     </div>
+                    <div style={{ display: "flex", gap: 6, marginBottom: 8 }}>
+                      <button
+                        onClick={() => setAddMode("available")}
+                        style={{
+                          flex: 1, cursor: "pointer", borderRadius: 8, padding: "7px", fontSize: 11.5, fontWeight: 600,
+                          border: `1px solid ${addMode === "available" ? "#3B6D11" : COLORS.line}`,
+                          background: addMode === "available" ? "#EAF3E4" : "transparent",
+                          color: addMode === "available" ? "#3B6D11" : COLORS.inkSoft,
+                        }}
+                      >
+                        Available
+                      </button>
+                      <button
+                        onClick={() => setAddMode("notAvailable")}
+                        style={{
+                          flex: 1, cursor: "pointer", borderRadius: 8, padding: "7px", fontSize: 11.5, fontWeight: 600,
+                          border: `1px solid ${addMode === "notAvailable" ? "#9A3634" : COLORS.line}`,
+                          background: addMode === "notAvailable" ? "#F5E1DC" : "transparent",
+                          color: addMode === "notAvailable" ? "#9A3634" : COLORS.inkSoft,
+                        }}
+                      >
+                        Not Available
+                      </button>
+                    </div>
                     <input
                       value={addSearchQuery}
                       onChange={(e) => { setAddSearchQuery(e.target.value); setGuestError(""); }}
@@ -8383,12 +8590,20 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                     )}
                     {addSearchQuery.trim() && (() => {
                       const q = addSearchQuery.trim().toLowerCase();
-                      const matches = players.filter((p) => !availableIds.includes(p.id) && !waitlistIds.includes(p.id) && p.name.toLowerCase().includes(q)).slice(0, 6);
+                      // Available mode excludes anyone already available or
+                      // waitlisted, same as always. Not Available mode only
+                      // excludes people already marked Not Available — someone
+                      // currently Available can still show up here, since
+                      // picking them is exactly how the admin corrects "actually,
+                      // they can't make it" on someone's behalf.
+                      const excludeIds = addMode === "available" ? [...availableIds, ...waitlistIds] : notAvailableIds;
+                      const addFn = addMode === "available" ? adminAddAvailable : adminAddNotAvailable;
+                      const matches = players.filter((p) => !excludeIds.includes(p.id) && p.name.toLowerCase().includes(q)).slice(0, 6);
                       if (matches.length === 0) {
                         return (
                           <div>
                             <div style={{ fontSize: 12, color: COLORS.inkSoft, padding: "6px 2px", marginBottom: 6 }}>No one on the roster matches "{addSearchQuery}".</div>
-                            {addGuestPlayer && (
+                            {addGuestPlayer && addMode === "available" && (
                               <button
                                 onClick={() => {
                                   const res = addGuestPlayer(addSearchQuery);
@@ -8412,7 +8627,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                           {matches.map((p, i) => (
                             <button
                               key={p.id}
-                              onClick={() => { adminAddAvailable(match.id, p.id); setAddSearchQuery(""); }}
+                              onClick={() => { addFn(match.id, p.id); setAddSearchQuery(""); }}
                               style={{
                                 width: "100%", display: "flex", alignItems: "center", gap: 8, textAlign: "left",
                                 background: "transparent", border: "none", cursor: "pointer", padding: "8px 10px",
