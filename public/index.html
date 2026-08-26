@@ -328,16 +328,23 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
   // and letting the viewer tap to unmute (a real user gesture, which
   // browsers do allow to start audio) is the standard way around that.
   const [muted, setMuted] = useState(true);
-  // Bumped on every "Try again" tap — in the effect's dependency array
-  // purely to force a fresh connection attempt without needing a whole
-  // separate retry code path.
+  // Bumped both on a manual "Try again" tap and by the auto-reconnect
+  // logic below — in the effect's dependency array purely to force a
+  // fresh connection attempt without needing a whole separate code path
+  // for "reconnect" vs "first connect".
   const [retryCount, setRetryCount] = useState(0);
+  // How many times this has auto-reconnected without the viewer having to
+  // tap anything — capped, and reset back to 0 once a connection actually
+  // holds, so a flaky network gets repeated fresh chances rather than
+  // burning through one fixed budget for the whole time the card's open.
+  const autoRetriesRef = React.useRef(0);
   const [meetingObj, setMeetingObj] = useState(null);
   // Total joined participants minus the one broadcaster — an
   // approximation (it assumes exactly one host), not an exact headcount,
   // but good enough for "roughly how many people are watching".
   const [viewerCount, setViewerCount] = useState(0);
   const [showChat, setShowChat] = useState(false);
+  const [pipSupported, setPipSupported] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -365,6 +372,7 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
       sessionRef.current = res.session;
       setMeetingObj(res.session.meeting);
       setStatus("live");
+      autoRetriesRef.current = 0;
 
       function pollCount() {
         try {
@@ -377,6 +385,35 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
       }
       pollCount();
       countPoll = setInterval(pollCount, 2000);
+
+      // Auto-reconnect on a real network drop. RealtimeKit fires roomLeft
+      // with state "disconnected" specifically for a temporary connection
+      // loss (as opposed to "left"/"kicked"/"ended", which are deliberate
+      // and shouldn't trigger a retry loop). Capped at 3 silent attempts
+      // before falling back to the manual "Try again" button, so a truly
+      // dead stream doesn't retry forever without the viewer knowing.
+      function handleDrop() {
+        if (cancelled) return;
+        if (countPoll) clearInterval(countPoll);
+        if (autoRetriesRef.current < 3) {
+          autoRetriesRef.current += 1;
+          setTimeout(() => { if (!cancelled) setRetryCount((c) => c + 1); }, 2000);
+        } else {
+          setStatus("error");
+          setErrorMsg("Lost connection to the stream — tap Try again");
+        }
+      }
+      try {
+        res.session.meeting.self.on("roomLeft", ({ state }) => {
+          if (state === "disconnected") handleDrop();
+        });
+      } catch (e) {}
+      // Belt-and-suspenders: a standard browser event on the track itself
+      // (not RealtimeKit-specific, so this one's reliable regardless of
+      // the SDK's own event names) — fires if the underlying connection
+      // drops the track even if roomLeft doesn't fire the way expected.
+      const track = res.session.stream.getVideoTracks()[0];
+      if (track) track.addEventListener("ended", handleDrop);
     })();
     return () => {
       cancelled = true;
@@ -386,12 +423,41 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
     };
   }, [meetingId, retryCount]);
 
+  useEffect(() => {
+    const el = videoRef.current;
+    const supported = (typeof document !== "undefined" && document.pictureInPictureEnabled) || !!(el && el.webkitSupportsPresentationMode);
+    setPipSupported(!!supported);
+  }, [status]);
+
   function handleUnmute() {
     if (videoRef.current) {
       videoRef.current.muted = false;
       videoRef.current.play().catch(() => {});
     }
     setMuted(false);
+  }
+
+  function handleRetryTap() {
+    autoRetriesRef.current = 0;
+    setRetryCount((c) => c + 1);
+  }
+
+  function handleFullscreen() {
+    const el = videoRef.current;
+    if (!el) return;
+    if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else if (el.webkitEnterFullscreen) el.webkitEnterFullscreen(); // iOS Safari's video-only fullscreen
+  }
+
+  function handlePiP() {
+    const el = videoRef.current;
+    if (!el) return;
+    if (document.pictureInPictureEnabled && el.requestPictureInPicture) {
+      el.requestPictureInPicture().catch(() => {});
+    } else if (el.webkitSupportsPresentationMode) {
+      el.webkitSetPresentationMode("picture-in-picture");
+    }
   }
 
   return (
@@ -418,19 +484,37 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
           </button>
         )}
         {status === "live" && (
-          <button
-            onClick={() => setShowChat((v) => !v)}
-            style={{ position: "absolute", bottom: 10, left: 10, background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: 20, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
-          >
-            💬 Chat
-          </button>
+          <div style={{ position: "absolute", bottom: 10, left: 10, display: "flex", gap: 6 }}>
+            <button
+              onClick={() => setShowChat((v) => !v)}
+              style={{ background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: 20, padding: "6px 12px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}
+            >
+              💬 Chat
+            </button>
+            <button
+              onClick={handleFullscreen}
+              title="Full screen"
+              style={{ background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: "50%", width: 28, height: 28, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+            >
+              ⛶
+            </button>
+            {pipSupported && (
+              <button
+                onClick={handlePiP}
+                title="Picture in picture"
+                style={{ background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: "50%", width: 28, height: 28, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
+              >
+                🖼️
+              </button>
+            )}
+          </div>
         )}
         {status !== "live" && (
           <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, color: "#fff", fontSize: 12, background: "rgba(0,0,0,0.55)", padding: 20, textAlign: "center" }}>
-            {status === "connecting" ? "Connecting…" : errorMsg}
+            {status === "connecting" ? (autoRetriesRef.current > 0 ? "Reconnecting…" : "Connecting…") : errorMsg}
             {status === "error" && (
               <button
-                onClick={() => setRetryCount((c) => c + 1)}
+                onClick={handleRetryTap}
                 style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 16px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
               >
                 Try again
@@ -527,6 +611,43 @@ function LiveChatPanel({ meeting }) {
     </div>
   );
 }
+// Finds every match/nets day currently live, regardless of which tab
+// happens to be open — matches is an object keyed by matchId, days is an
+// object keyed by ISO date, same shape as everywhere else in this app
+// that iterates them. Cheap enough to just recompute on every render
+// rather than memoize, at this app's scale.
+function computeLiveItems(matches, days) {
+  const items = [];
+  Object.keys(matches || {}).forEach((id) => {
+    const m = matches[id];
+    if (m && m.liveMeetingId) items.push({ type: "match", id, label: `${m.matchType || "Match"} · ${m.groundName || "Ground TBD"}` });
+  });
+  Object.keys(days || {}).forEach((iso) => {
+    const d = days[iso];
+    if (d && d.liveMeetingId) items.push({ type: "nets", id: iso, label: `Nets · ${fmtDateShort(iso)}` });
+  });
+  return items;
+}
+// A visible-from-anywhere "something's live" banner — without this, the
+// only way to notice a broadcast was already happening was to have the
+// right tab open and the right card expanded. Tapping it switches to the
+// right tab (and, for a nets day, jumps straight to that date); for a
+// match, the LIVE badge on its own card takes it from there rather than
+// this reaching into that card's local expand state.
+function LiveNowBanner({ items, onJump }) {
+  if (!items || items.length === 0) return null;
+  return (
+    <div
+      onClick={() => onJump(items[0])}
+      style={{ background: "#D62828", color: "#fff", borderRadius: 10, padding: "10px 14px", marginBottom: 14, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, cursor: "pointer" }}
+    >
+      <span style={{ fontSize: 13, fontWeight: 700 }}>
+        🔴 {items[0].label} is live now{items.length > 1 ? ` (+${items.length - 1} more)` : ""}
+      </span>
+      <span style={{ fontSize: 11, opacity: 0.85, whiteSpace: "nowrap" }}>Tap to watch →</span>
+    </div>
+  );
+}
 // The broadcaster's own screen — camera preview, a live status line, and
 // Stop. Closing this any way (the ✕ or Stop itself) ends the broadcast;
 // there's deliberately no "minimize and keep going" option, since the
@@ -551,6 +672,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
   // (on/off).
   const [torchOn, setTorchOn] = useState(null);
   const [audioOn, setAudioOn] = useState(true);
+  const [dataSaver, setDataSaver] = useState(false);
   const [cameras, setCameras] = useState([]);
   const [activeCameraId, setActiveCameraId] = useState("");
   // Who's currently watching — [{ id, name }]. Polled rather than wired to
@@ -561,6 +683,42 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
   const [viewers, setViewers] = useState([]);
   const [showViewers, setShowViewers] = useState(false);
   const [showChat, setShowChat] = useState(false);
+  // Bumped both by a manual "Reconnect" tap and by the auto-reconnect
+  // logic below — forces the effect to redo the whole connect flow
+  // (which necessarily opens a fresh RealtimeKit meeting; there's no
+  // "rejoin the same meeting" API to lean on here).
+  const [retryCount, setRetryCount] = useState(0);
+  const autoRetriesRef = React.useRef(0);
+  // Whether this has ever successfully gone live at least once — decides
+  // both whether "Stop"/Firestore cleanup should fire on close (a
+  // dropped-and-never-recovered connection still needs liveMeetingId
+  // cleared, even though the on-screen status is "error" at that point)
+  // and which buttons the bottom bar shows.
+  const hasGoneLiveRef = React.useRef(false);
+  const [pipSupported, setPipSupported] = useState(false);
+  // Continuous broadcast time — set once on the very first successful
+  // connect and never reset by a reconnect, so a brief drop-and-recover
+  // doesn't restart the clock. Ticks via its own effect below.
+  const liveStartRef = React.useRef(null);
+  const [elapsedSec, setElapsedSec] = useState(0);
+  // A safety net for the phone being left broadcasting by accident —
+  // battery drain, data usage, and (once RealtimeKit's Beta pricing ends)
+  // real cost. Checks in every CHECK_AFTER_SEC of continuous live time;
+  // no response within GRACE_SEC stops the broadcast automatically.
+  // Confirming just pushes the next check-in out by the same interval
+  // again, rather than disabling the safety net for the rest of the
+  // broadcast.
+  const CHECK_AFTER_SEC = 3 * 60 * 60;
+  const GRACE_SEC = 2 * 60;
+  const [showStillThere, setShowStillThere] = useState(false);
+  const nextCheckRef = React.useRef(CHECK_AFTER_SEC);
+  const graceDeadlineRef = React.useRef(null);
+  // A one-time nudge if the broadcaster's holding the phone in portrait —
+  // cricket is wide-format, landscape gives viewers a much better view.
+  // Re-checks on device rotation; dismissing it just hides it for the
+  // rest of this broadcast rather than nagging repeatedly.
+  const [showLandscapeHint, setShowLandscapeHint] = useState(false);
+  const [landscapeHintDismissed, setLandscapeHintDismissed] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -580,7 +738,16 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
       setMeetingObj(res.session.meeting);
       if (videoRef.current) videoRef.current.srcObject = res.session.stream;
       setStatus("live");
-      onStarted(res.session.meetingId);
+      setErrorMsg("");
+      hasGoneLiveRef.current = true;
+      autoRetriesRef.current = 0;
+      if (!liveStartRef.current) liveStartRef.current = Date.now();
+      // isReconnect (second arg) tells the caller whether to skip its own
+      // "🔴 Live now!" push notification — nobody wants a fresh alert every
+      // time a flaky connection blips and silently recovers, but Firestore's
+      // liveMeetingId still has to update either way so every viewer's own
+      // client can find the new meeting.
+      onStarted(res.session.meetingId, retryCount > 0);
 
       const track = res.session.stream.getVideoTracks()[0];
       if (track && track.getCapabilities) {
@@ -594,6 +761,9 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
         } catch (e) {
           // No extra capabilities reported — zoom/torch controls just stay hidden.
         }
+      }
+      if (track && dataSaver) {
+        track.applyConstraints({ width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 15 } }).catch(() => {});
       }
 
       try {
@@ -618,6 +788,32 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
       }
       pollViewers();
       viewerPoll = setInterval(pollViewers, 2000);
+
+      // Auto-reconnect on a real network drop — same "disconnected" state
+      // and same reasoning as LiveViewer's version of this. A reconnect
+      // here necessarily opens a brand-new RealtimeKit meeting (there's no
+      // "rejoin the same one" API), so onStarted fires again above with
+      // the new meetingId once it succeeds — that's what lets every
+      // viewer's own client follow along automatically.
+      function handleDrop() {
+        if (cancelled) return;
+        if (viewerPoll) clearInterval(viewerPoll);
+        if (autoRetriesRef.current < 2) {
+          autoRetriesRef.current += 1;
+          setStatus("starting");
+          setErrorMsg("");
+          setTimeout(() => { if (!cancelled) setRetryCount((c) => c + 1); }, 2000);
+        } else {
+          setStatus("error");
+          setErrorMsg("Connection lost — tap Reconnect to go live again");
+        }
+      }
+      try {
+        res.session.meeting.self.on("roomLeft", ({ state }) => {
+          if (state === "disconnected") handleDrop();
+        });
+      } catch (e) {}
+      if (track) track.addEventListener("ended", handleDrop);
     })();
     return () => {
       cancelled = true;
@@ -625,10 +821,85 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
       stopLiveBroadcast(sessionRef.current);
       sessionRef.current = null;
     };
-    // Deliberately mount-once (empty deps) — every prop here is only ever
-    // read inside the async callback above, not on every render, so none
-    // of them need to be dependencies.
-  }, []);
+  }, [retryCount]);
+
+  useEffect(() => {
+    const el = videoRef.current;
+    const supported = (typeof document !== "undefined" && document.pictureInPictureEnabled) || !!(el && el.webkitSupportsPresentationMode);
+    setPipSupported(!!supported);
+  }, [status]);
+
+  // Ticks the live duration once a second and drives the "still
+  // broadcasting?" safety check-in off the same clock.
+  useEffect(() => {
+    if (status !== "live") return;
+    const id = setInterval(() => {
+      if (!liveStartRef.current) return;
+      const sec = Math.floor((Date.now() - liveStartRef.current) / 1000);
+      setElapsedSec(sec);
+      if (sec >= nextCheckRef.current && graceDeadlineRef.current === null) {
+        graceDeadlineRef.current = sec + GRACE_SEC;
+        setShowStillThere(true);
+      }
+      if (graceDeadlineRef.current !== null && sec >= graceDeadlineRef.current) {
+        handleStop();
+      }
+    }, 1000);
+    return () => clearInterval(id);
+    // handleStop is defined below and stable enough in practice (it only
+    // reads refs and props) — not worth restructuring the component to
+    // satisfy a dependency an eslint-less codebase doesn't actually check.
+  }, [status]);
+
+  useEffect(() => {
+    if (status !== "live" || landscapeHintDismissed) return;
+    function check() {
+      const isPortrait = typeof window !== "undefined" && window.matchMedia && window.matchMedia("(orientation: portrait)").matches;
+      setShowLandscapeHint(!!isPortrait);
+    }
+    check();
+    window.addEventListener("resize", check);
+    return () => window.removeEventListener("resize", check);
+  }, [status, landscapeHintDismissed]);
+
+  function handleStillHere() {
+    setShowStillThere(false);
+    graceDeadlineRef.current = null;
+    nextCheckRef.current = elapsedSec + CHECK_AFTER_SEC;
+  }
+
+  function formatDuration(sec) {
+    const h = Math.floor(sec / 3600);
+    const m = Math.floor((sec % 3600) / 60);
+    const s = sec % 60;
+    const pad = (n) => String(n).padStart(2, "0");
+    return h > 0 ? `${h}:${pad(m)}:${pad(s)}` : `${m}:${pad(s)}`;
+  }
+
+  function handleFullscreen() {
+    const el = videoRef.current;
+    if (!el) return;
+    if (el.requestFullscreen) el.requestFullscreen().catch(() => {});
+    else if (el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+    else if (el.webkitEnterFullscreen) el.webkitEnterFullscreen(); // iOS Safari's video-only fullscreen
+  }
+
+  function handlePiP() {
+    const el = videoRef.current;
+    if (!el) return;
+    if (document.pictureInPictureEnabled && el.requestPictureInPicture) {
+      el.requestPictureInPicture().catch(() => {});
+    } else if (el.webkitSupportsPresentationMode) {
+      el.webkitSetPresentationMode("picture-in-picture");
+    }
+  }
+
+  function handleManualReconnect() {
+    autoRetriesRef.current = 0;
+    setStatus("starting");
+    setErrorMsg("");
+    setRetryCount((c) => c + 1);
+  }
 
   function handleZoomChange(rawValue) {
     const value = Number(rawValue);
@@ -658,6 +929,22 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
     }
   }
 
+  // Lower resolution/framerate on the outgoing video — useful for anyone
+  // broadcasting on mobile data rather than wifi. A plain constraint on
+  // the raw track, same mechanism as zoom/torch — nothing RealtimeKit-
+  // specific, so no Beta-SDK risk here.
+  function handleToggleDataSaver() {
+    const track = sessionRef.current && sessionRef.current.stream.getVideoTracks()[0];
+    const next = !dataSaver;
+    if (track) {
+      const constraints = next
+        ? { width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 15 } }
+        : { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+      track.applyConstraints(constraints).catch(() => {});
+    }
+    setDataSaver(next);
+  }
+
   async function handleCameraChange(deviceId) {
     const meeting = sessionRef.current && sessionRef.current.meeting;
     const device = cameras.find((d) => d.deviceId === deviceId);
@@ -677,6 +964,9 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
       if (meeting.self.audioTrack) freshStream.addTrack(meeting.self.audioTrack);
       if (sessionRef.current) sessionRef.current.stream = freshStream;
       if (videoRef.current) videoRef.current.srcObject = freshStream;
+      if (dataSaver && meeting.self.videoTrack) {
+        meeting.self.videoTrack.applyConstraints({ width: { ideal: 640 }, height: { ideal: 360 }, frameRate: { ideal: 15 } }).catch(() => {});
+      }
 
       // Zoom/torch capabilities can differ per camera (e.g. a wide lens
       // vs. a telephoto one) — re-check against the new track rather than
@@ -705,7 +995,11 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
   function handleStop() {
     stopLiveBroadcast(sessionRef.current);
     sessionRef.current = null;
-    if (status === "live") onStopped();
+    // hasGoneLiveRef, not the current status — a connection that dropped
+    // and ran out of auto-reconnect attempts is showing "error" on screen,
+    // but Firestore's liveMeetingId still needs clearing, or every
+    // viewer's card is left pointing at a dead meeting forever.
+    if (hasGoneLiveRef.current) onStopped();
     onClose();
   }
 
@@ -719,7 +1013,29 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
           />
           {status === "live" && (
             <div style={{ position: "absolute", top: 10, left: 10, background: "#D62828", color: "#fff", fontSize: 10, fontWeight: 800, padding: "4px 9px", borderRadius: 20 }}>
-              🔴 LIVE
+              🔴 LIVE · {formatDuration(elapsedSec)}
+            </div>
+          )}
+          {status === "live" && showLandscapeHint && (
+            <div style={{ position: "absolute", top: 40, left: 10, right: 10, background: "rgba(0,0,0,0.7)", color: "#fff", fontSize: 11, borderRadius: 8, padding: "6px 10px", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+              <span>📱 Rotate your phone — cricket looks better in landscape</span>
+              <button
+                onClick={() => setLandscapeHintDismissed(true)}
+                style={{ background: "transparent", border: "none", color: "#fff", cursor: "pointer", fontSize: 13, padding: 0, lineHeight: 1 }}
+              >
+                ✕
+              </button>
+            </div>
+          )}
+          {status === "live" && showStillThere && (
+            <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 12, color: "#fff", fontSize: 12, background: "rgba(0,0,0,0.75)", padding: 20, textAlign: "center" }}>
+              <span>Still broadcasting? This stops automatically in a couple of minutes if there's no response.</span>
+              <button
+                onClick={handleStillHere}
+                style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "8px 18px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}
+              >
+                Yes, still here
+              </button>
             </div>
           )}
           {status === "live" && (
@@ -740,11 +1056,27 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
               >
                 {audioOn ? "🎤" : "🔇"}
               </button>
+              <button
+                onClick={handleFullscreen}
+                title="Full screen"
+                style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.5)", color: "#fff", cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center" }}
+              >
+                ⛶
+              </button>
+              {pipSupported && (
+                <button
+                  onClick={handlePiP}
+                  title="Picture in picture"
+                  style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.5)", color: "#fff", cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center" }}
+                >
+                  🖼️
+                </button>
+              )}
             </div>
           )}
           {status !== "live" && (
             <div style={{ position: "absolute", inset: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#fff", fontSize: 12, background: "rgba(0,0,0,0.55)", padding: 20, textAlign: "center" }}>
-              {status === "starting" ? "Starting your camera…" : errorMsg}
+              {status === "starting" ? (retryCount > 0 ? "Reconnecting…" : "Starting your camera…") : errorMsg}
             </div>
           )}
           {status === "live" && zoom && (
@@ -770,6 +1102,15 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
               <option key={d.deviceId || i} value={d.deviceId}>{d.label || `Camera ${i + 1}`}</option>
             ))}
           </select>
+        )}
+
+        {status === "live" && (
+          <button
+            onClick={handleToggleDataSaver}
+            style={{ width: "100%", marginBottom: 10, background: dataSaver ? COLORS.willow : "rgba(255,255,255,0.08)", border: "none", color: "#fff", borderRadius: 10, padding: "9px 10px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+          >
+            📉 Data saver {dataSaver ? "On" : "Off"}
+          </button>
         )}
 
         {status === "live" && (
@@ -806,12 +1147,29 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
         <div style={{ fontSize: 11, color: "#B7C4B8", textAlign: "center", marginBottom: 14 }}>
           Keep this screen open and your phone unlocked — the broadcast pauses if you switch apps or lock the screen.
         </div>
-        <button
-          onClick={handleStop}
-          style={{ width: "100%", background: status === "live" ? "#D62828" : "rgba(255,255,255,0.15)", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
-        >
-          {status === "live" ? "⏹ Stop broadcasting" : "Cancel"}
-        </button>
+        {status === "error" && hasGoneLiveRef.current ? (
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={handleManualReconnect}
+              style={{ flex: 1, background: COLORS.willow, color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+            >
+              🔁 Reconnect
+            </button>
+            <button
+              onClick={handleStop}
+              style={{ flex: 1, background: "rgba(255,255,255,0.15)", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+            >
+              Close
+            </button>
+          </div>
+        ) : (
+          <button
+            onClick={handleStop}
+            style={{ width: "100%", background: status === "live" ? "#D62828" : "rgba(255,255,255,0.15)", color: "#fff", border: "none", borderRadius: 10, padding: "12px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}
+          >
+            {status === "live" ? "⏹ Stop broadcasting" : "Cancel"}
+          </button>
+        )}
       </div>
     </div>
   );
@@ -2402,6 +2760,33 @@ function removeKnownProfile(teamCode, playerId) {
   writeKnownProfiles(readKnownProfiles().filter((p) => !(p.teamCode === teamCode && p.playerId === playerId)));
 }
 
+// Remembers this device's own pending registration (one at a time — a
+// second registration attempt before the first resolves would just
+// overwrite it, which is fine) so reopening the app before an admin has
+// approved it can recognize that and say so, instead of dropping the
+// person back at a blank sign-in with no memory of having just registered.
+const PENDING_REG_KEY = "cricket_nets_pending_reg";
+function readPendingReg() {
+  try {
+    const raw = window.localStorage.getItem(PENDING_REG_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+}
+function writePendingReg(entry) {
+  try {
+    window.localStorage.setItem(PENDING_REG_KEY, JSON.stringify(entry));
+  } catch {
+    /* ignore — worst case, the recognition just doesn't kick in next time */
+  }
+}
+function clearPendingReg() {
+  try {
+    window.localStorage.removeItem(PENDING_REG_KEY);
+  } catch {}
+}
+
 // Auto-center-crop (kept as a fallback / used internally by the crop math
 // below). The crop modal lets the person adjust WHERE within the photo
 // this square comes from, since a pure center-crop often cuts off faces.
@@ -2666,6 +3051,11 @@ function CricketNetsTracker() {
   // ModeSelect) — consumed once that team's roster has loaded, to confirm
   // the player still exists and pre-select them on the PIN screen.
   const [pendingAutoPlayer, setPendingAutoPlayer] = useState(null); // { teamCode, playerId } | null
+  // Which pre-auth screen PlayerArea should open straight into — set by
+  // which button was tapped on the merged ModeSelect screen ("login" for
+  // Sign in, "register" for New here?), so PlayerArea never needs its own
+  // separate "who's checking in" fork of that same choice.
+  const [initialPlayerAuthView, setInitialPlayerAuthView] = useState("login");
   function rememberProfile(profile) {
     upsertKnownProfile(profile);
     setKnownProfiles(readKnownProfiles());
@@ -2741,7 +3131,7 @@ function CricketNetsTracker() {
   useEffect(() => {
     if (mode === "player" && pendingAutoPlayer) setPendingAutoPlayer(null);
   }, [mode]);
-  const [tab, setTab] = useState("log");
+  const [tab, setTab] = useState("home");
   const [activeMonth, setActiveMonth] = useState(monthKey(new Date()));
   const [newPlayerName, setNewPlayerName] = useState("");
   const [playerError, setPlayerError] = useState("");
@@ -4120,10 +4510,15 @@ function CricketNetsTracker() {
   // match object as two more fields, same as everything else
   // updateMatchField already touches, no new Firestore key or rules
   // change needed.
-  function startMatchLive(matchId, meetingId, broadcasterId) {
+  // notify=false is used on an auto-reconnect — Firestore's liveMeetingId
+  // still has to update (to the fresh meeting a dropped connection
+  // reconnected into), so every viewer's own client picks it up, but there's
+  // no reason to re-push "🔴 Live now!" to the whole squad every time a
+  // flaky connection blips and recovers.
+  function startMatchLive(matchId, meetingId, broadcasterId, notify = true) {
     updateMatchField(matchId, "liveMeetingId", meetingId);
     updateMatchField(matchId, "liveBroadcasterId", broadcasterId);
-    if (matches[matchId]) notifyMatchLive(matches[matchId], broadcasterId);
+    if (notify && matches[matchId]) notifyMatchLive(matches[matchId], broadcasterId);
   }
   function stopMatchLive(matchId) {
     updateMatchField(matchId, "liveMeetingId", null);
@@ -4133,12 +4528,13 @@ function CricketNetsTracker() {
   // `days` object (keyed by ISO date) rather than `matches` — no separate
   // "session" record to create, liveMeetingId/liveBroadcasterId just ride
   // on that day's entry the same way votes/hours/balls already do.
-  function startNetsLive(iso, meetingId, broadcasterId) {
+  // notify=false on an auto-reconnect — see startMatchLive's comment.
+  function startNetsLive(iso, meetingId, broadcasterId, notify = true) {
     setDays((prev) => {
       const cur = prev[iso] || { votes: [], hours: 0, balls: 0 };
       return { ...prev, [iso]: { ...cur, liveMeetingId: meetingId, liveBroadcasterId: broadcasterId } };
     });
-    notifyNetsLive(iso, broadcasterId);
+    if (notify) notifyNetsLive(iso, broadcasterId);
   }
   function stopNetsLive(iso) {
     setDays((prev) => {
@@ -4754,7 +5150,8 @@ function CricketNetsTracker() {
       {mode === "select" && !(pendingAutoPlayer && pendingAutoPlayer.teamCode === activeTeam) && (
         <ModeSelect
           onAdmin={() => { setSessionExpiredNotice(false); setMode("admin-login"); }}
-          onPlayer={() => { setSessionExpiredNotice(false); setMode("player"); }}
+          onPlayer={() => { setSessionExpiredNotice(false); setInitialPlayerAuthView("login"); setMode("player"); }}
+          onRegister={() => { setSessionExpiredNotice(false); setInitialPlayerAuthView("register"); setMode("player"); }}
           sessionExpiredNotice={sessionExpiredNotice}
           showInstallBanner={!isStandalone && !installDismissed && (installPromptEvent || isIOS)}
           isIOS={isIOS}
@@ -4825,6 +5222,9 @@ function CricketNetsTracker() {
           setPlayerVideo={setPlayerVideo}
           removePlayerVideo={removePlayerVideo}
           initialSelectedId={pendingAutoPlayer && pendingAutoPlayer.teamCode === activeTeam ? pendingAutoPlayer.playerId : null}
+          initialAuthView={initialPlayerAuthView}
+          activeTeam={activeTeam}
+          pendingRegistrations={pendingRegistrations}
           rememberProfile={(playerId, playerName) => rememberProfile({ teamCode: activeTeam, teamName: teamRecord ? teamRecord.teamName : "", playerId, playerName })}
           submitPlayerPinResetRequest={submitPlayerPinResetRequest}
           marketplace={marketplace}
@@ -4922,8 +5322,24 @@ function CricketNetsTracker() {
               </div>
               {adminPushError && <div style={{ fontSize: 11, color: COLORS.leather, marginTop: 8 }}>{adminPushError}</div>}
             </div>
+            <LiveNowBanner
+              items={computeLiveItems(matches, days)}
+              onJump={(item) => {
+                if (item.type === "match") setTab("matches");
+                else { setTab("log"); setSelectedDate(item.id); }
+              }}
+            />
             {saveError && <div style={{ background: "#FCEBEA", color: COLORS.leather, padding: "8px 12px", borderRadius: 8, fontSize: 13, marginBottom: 14 }}>{saveError}</div>}
 
+            {tab === "home" && (
+              <AdminHomeDashboard
+                matches={matches} days={days} players={players}
+                pendingRegistrations={pendingRegistrations} playerPinResetRequests={playerPinResetRequests}
+                subs={subs} payments={payments} activeMonth={activeMonth} rates={activeMonthRates}
+                marketplace={marketplace} setTab={setTab} setSelectedDate={setSelectedDate}
+                notifyPendingVotesNudge={notifyPendingVotesNudge} notifySubReminderNudge={notifySubReminderNudge}
+              />
+            )}
             {tab === "log" && (
               <DailyLog
                 selectedDate={selectedDate}
@@ -5013,6 +5429,7 @@ function CricketNetsTracker() {
 function BottomNav({ tab, setTab }) {
   const [showMore, setShowMore] = useState(false);
   const items = [
+    { key: "home", icon: "🏠", label: "Home" },
     { key: "log", icon: "📅", label: "Log" },
     { key: "sub", icon: "💰", label: "Sub" },
     { key: "players", icon: "👥", label: "Players" },
@@ -5081,6 +5498,137 @@ function PlainStatCard({ value, label, accent }) {
     <div style={{ background: COLORS.pitchLight, borderRadius: 12, padding: "12px 14px" }}>
       <div className="scorenum" style={{ fontSize: 18, color: accent || COLORS.cream, lineHeight: 1 }}>{value}</div>
       <div style={{ fontSize: 11, color: "#9BAE9E", marginTop: 4 }}>{label}</div>
+    </div>
+  );
+}
+
+// The Admin "Home" tab — a summary built entirely from state the rest of
+// the admin tabs already own (matches, days, pendingRegistrations,
+// playerPinResetRequests, subs/payments, marketplace). Nothing new is
+// stored here; every count and every action just reads/writes through the
+// exact same functions the individual tabs already use. The live-broadcast
+// banner isn't repeated here — it's already shown above every admin tab,
+// this just doesn't duplicate it.
+function AdminHomeDashboard({ matches, days, players, pendingRegistrations, playerPinResetRequests, subs, payments, activeMonth, rates, marketplace, setTab, setSelectedDate, notifyPendingVotesNudge, notifySubReminderNudge }) {
+  const today = todayISO();
+  const upcomingMatches = Object.values(matches || {}).filter((m) => m.date && m.date >= today).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const nextMatch = upcomingMatches[0] || null;
+  const nextMatchNotResponded = nextMatch
+    ? players.filter((p) => !(nextMatch.available || []).includes(p.id) && !(nextMatch.notAvailable || []).includes(p.id) && !(nextMatch.waitlist || []).includes(p.id))
+    : [];
+
+  const nextNetsIso = nextWeekday(today);
+  const nextNetsData = days[nextNetsIso] || { votes: [], declined: [] };
+  const nextNetsNotResponded = players.filter((p) => !(nextNetsData.votes || []).includes(p.id) && !(nextNetsData.declined || []).includes(p.id));
+
+  const pendingRegList = Object.values(pendingRegistrations || {});
+  const pinResetList = Object.values(playerPinResetRequests || {});
+
+  const monthSubPlayers = subs[activeMonth] || [];
+  const monthPayments = payments[activeMonth] || {};
+  const unpaidPlayers = players.filter((p) => monthSubPlayers.includes(p.id) && !monthPayments[p.id]);
+  const collected = monthSubPlayers.reduce((sum, id) => sum + (Number(monthPayments[id]) || 0), 0);
+  const expected = monthSubPlayers.length * (rates.subAmount || 0);
+  const pct = expected > 0 ? Math.min(100, Math.round((collected / expected) * 100)) : 0;
+
+  const activeListings = Object.values(marketplace || {}).filter((l) => l.status === "active");
+
+  const attention = [
+    pendingRegList.length > 0 && { key: "reg", label: "🆕 New registrations", count: pendingRegList.length, onClick: () => setTab("players") },
+    pinResetList.length > 0 && { key: "pin", label: "🔑 PIN reset requests", count: pinResetList.length, onClick: () => setTab("players") },
+    nextMatch && nextMatchNotResponded.length > 0 && {
+      key: "match", label: `🏏 Not confirmed for ${cleanField(nextMatch.groundName, nextMatch.matchType || "the match")}`,
+      count: nextMatchNotResponded.length, onClick: () => setTab("matches"),
+    },
+    nextNetsNotResponded.length > 0 && {
+      key: "nets", label: "🎾 Not confirmed for nets", count: nextNetsNotResponded.length,
+      onClick: () => { setTab("log"); setSelectedDate(nextNetsIso); },
+      onNudge: notifyPendingVotesNudge ? () => notifyPendingVotesNudge(nextNetsNotResponded.map((p) => p.id), nextNetsIso) : null,
+    },
+    unpaidPlayers.length > 0 && {
+      key: "unpaid", label: "💰 Unpaid this month", count: unpaidPlayers.length, onClick: () => setTab("sub"),
+      onNudge: notifySubReminderNudge ? () => notifySubReminderNudge(unpaidPlayers.map((p) => p.id)) : null,
+    },
+  ].filter(Boolean);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16 }}>
+        <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 10 }}>Needs you</div>
+        {attention.length === 0 ? (
+          <div style={{ fontSize: 12.5, color: COLORS.inkSoft }}>Nothing pending — you're all caught up ✓</div>
+        ) : (
+          attention.map((a) => (
+            <div key={a.key} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 0", borderBottom: `1px solid ${COLORS.line}`, gap: 8 }}>
+              <div onClick={a.onClick} style={{ display: "flex", alignItems: "center", gap: 8, cursor: "pointer", flex: 1, fontSize: 12.5 }}>
+                <span>{a.label}</span>
+                <span style={{ background: "#F6E9D2", color: "#8A5A17", fontSize: 11, fontWeight: 700, padding: "2px 8px", borderRadius: 20, minWidth: 20, textAlign: "center" }}>{a.count}</span>
+              </div>
+              {a.onNudge && (
+                <button onClick={a.onNudge} style={{ background: "transparent", border: `1px solid ${COLORS.willow}`, color: COLORS.leather, borderRadius: 7, padding: "5px 10px", fontSize: 11, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                  Nudge
+                </button>
+              )}
+            </div>
+          ))
+        )}
+      </div>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+        <div onClick={() => setTab("matches")} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 13, cursor: "pointer" }}>
+          <div style={{ fontSize: 10.5, fontWeight: 700, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 5 }}>Next match</div>
+          {nextMatch ? (
+            <>
+              <div style={{ fontSize: 13, fontWeight: 700 }}>{cleanField(nextMatch.groundName, "Ground TBD")}</div>
+              <div style={{ fontSize: 11, color: COLORS.inkSoft, marginTop: 2 }}>{fmtDateShort(nextMatch.date)}</div>
+              <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.willow, marginTop: 6 }}>{(nextMatch.available || []).length}{nextMatch.capacity ? ` / ${nextMatch.capacity}` : ""} in</div>
+            </>
+          ) : (
+            <div style={{ fontSize: 12, color: COLORS.inkSoft }}>None scheduled</div>
+          )}
+        </div>
+        <div onClick={() => { setTab("log"); setSelectedDate(nextNetsIso); }} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 13, cursor: "pointer" }}>
+          <div style={{ fontSize: 10.5, fontWeight: 700, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 5 }}>Next nets</div>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>{dayOfWeekName(nextNetsIso)}</div>
+          <div style={{ fontSize: 11, color: COLORS.inkSoft, marginTop: 2 }}>{fmtDateShort(nextNetsIso)}</div>
+          <div style={{ fontSize: 11, fontWeight: 600, color: COLORS.willow, marginTop: 6 }}>{(nextNetsData.votes || []).length} confirmed</div>
+        </div>
+      </div>
+
+      <div onClick={() => setTab("sub")} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, cursor: "pointer" }}>
+        <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>This month's dues</div>
+        <div style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", marginBottom: 8 }}>
+          <span className="scorenum" style={{ fontSize: 22 }}>{fmtINR(collected)}</span>
+          <span style={{ fontSize: 12, color: COLORS.inkSoft }}>of {fmtINR(expected)}</span>
+        </div>
+        <div style={{ height: 7, borderRadius: 20, background: COLORS.line, overflow: "hidden", marginBottom: 8 }}>
+          <div style={{ height: "100%", width: `${pct}%`, background: COLORS.willow, borderRadius: 20 }} />
+        </div>
+        <div style={{ fontSize: 11.5, color: COLORS.inkSoft }}>{monthSubPlayers.length - unpaidPlayers.length} of {monthSubPlayers.length} players paid{unpaidPlayers.length > 0 ? ` · ${unpaidPlayers.length} outstanding` : ""}</div>
+      </div>
+
+      <div onClick={() => setTab("gear")} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, cursor: "pointer" }}>
+        <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>Gear Exchange</div>
+        <div style={{ fontSize: 12.5, color: COLORS.inkSoft }}>{activeListings.length} active listing{activeListings.length === 1 ? "" : "s"}</div>
+      </div>
+
+      {/* Attendance/Subscription/Players are already one tap away in the
+          bottom bar below — repeating them here would just be the exact
+          same destinations twice. Matches/Gear/Settings live behind the
+          "More" menu instead, so a direct shortcut to those three actually
+          saves a tap rather than duplicating one. */}
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+        {[
+          { icon: "🏏", label: "Matches", key: "matches" },
+          { icon: "🛒", label: "Gear", key: "gear" },
+          { icon: "⚙", label: "Settings", key: "settings" },
+        ].map((l) => (
+          <button key={l.key} onClick={() => setTab(l.key)} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 6px", textAlign: "center", fontSize: 10.5, fontWeight: 600, color: COLORS.ink, cursor: "pointer" }}>
+            <div style={{ fontSize: 16, marginBottom: 4 }}><Icon size={16}>{l.icon}</Icon></div>
+            {l.label}
+          </button>
+        ))}
+      </div>
     </div>
   );
 }
@@ -5489,6 +6037,20 @@ function SuperAdminFlow({
       </div>
 
       <div className="w-600" style={{ margin: "0 auto", padding: 20 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8, marginBottom: 18 }}>
+          <div onClick={() => setSubTab("requests")} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 8px", textAlign: "center", cursor: "pointer" }}>
+            <div className="scorenum" style={{ fontSize: 22 }}>{pending.length}</div>
+            <div style={{ fontSize: 9.5, color: COLORS.inkSoft, textTransform: "uppercase", letterSpacing: 0.3, marginTop: 2 }}>Pending<br/>requests</div>
+          </div>
+          <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 8px", textAlign: "center" }}>
+            <div className="scorenum" style={{ fontSize: 22 }}>{pinResetList.length}</div>
+            <div style={{ fontSize: 9.5, color: COLORS.inkSoft, textTransform: "uppercase", letterSpacing: 0.3, marginTop: 2 }}>PIN<br/>resets</div>
+          </div>
+          <div onClick={() => setSubTab("teams")} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 8px", textAlign: "center", cursor: "pointer" }}>
+            <div className="scorenum" style={{ fontSize: 22 }}>{entries.filter((t) => t.status === "approved").length}</div>
+            <div style={{ fontSize: 9.5, color: COLORS.inkSoft, textTransform: "uppercase", letterSpacing: 0.3, marginTop: 2 }}>Active<br/>teams</div>
+          </div>
+        </div>
         {subTab === "requests" ? (
           <>
             <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 12 }}>
@@ -5729,7 +6291,7 @@ function TeamManageCard({ team, resetTeamAdminPin, suspendTeam, reactivateTeam, 
   );
 }
 
-function ModeSelect({ onAdmin, onPlayer, sessionExpiredNotice, showInstallBanner, isIOS, canPromptInstall, onInstallClick, onDismissInstall, teamRecord, switchTeam, onViewLogo, knownProfile, onContinueAsKnown }) {
+function ModeSelect({ onAdmin, onPlayer, onRegister, sessionExpiredNotice, showInstallBanner, isIOS, canPromptInstall, onInstallClick, onDismissInstall, teamRecord, switchTeam, onViewLogo, knownProfile, onContinueAsKnown }) {
   return (
     <div style={{ minHeight: 480, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: COLORS.pitch, color: COLORS.cream, padding: 24, textAlign: "center" }}>
       {teamRecord && teamRecord.logo && (
@@ -5738,7 +6300,7 @@ function ModeSelect({ onAdmin, onPlayer, sessionExpiredNotice, showInstallBanner
         </div>
       )}
       <div style={{ fontSize: 11, letterSpacing: 3, textTransform: "uppercase", color: COLORS.willow, fontWeight: 600, marginBottom: 6 }}>{teamRecord ? teamRecord.teamName : "Pavilion"}</div>
-      <div className="scorenum" style={{ fontSize: 36, marginBottom: sessionExpiredNotice ? 14 : 28 }}>Who's checking in?</div>
+      <div className="scorenum" style={{ fontSize: 36, marginBottom: sessionExpiredNotice ? 14 : 28 }}>Sign in</div>
       {sessionExpiredNotice && (
         <div className="w-320" style={{ background: "rgba(192,138,69,0.18)", border: `1px solid ${COLORS.willow}`, color: COLORS.cream, borderRadius: 10, padding: "8px 14px", fontSize: 12, marginBottom: 20 }}>
           You were signed out after 15 minutes for security. Sign in again to continue.
@@ -5769,11 +6331,16 @@ function ModeSelect({ onAdmin, onPlayer, sessionExpiredNotice, showInstallBanner
           </button>
         </div>
       ) : (
-        <div className="w-320" style={{ display: "flex", flexDirection: "column", gap: 12, width: "100%" }}>
-          <button onClick={onPlayer} style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 10, padding: "14px 18px", fontSize: 15, fontWeight: 600, cursor: "pointer" }}>
-            I'm a player — cast my vote
+        <div className="w-320" style={{ display: "flex", flexDirection: "column", gap: 10, width: "100%" }}>
+          <button onClick={onPlayer} style={{ textAlign: "left", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 12, padding: "14px 16px", cursor: "pointer" }}>
+            <div style={{ fontSize: 15, fontWeight: 700 }}>Sign in</div>
+            <div style={{ fontSize: 11.5, opacity: 0.9, marginTop: 2 }}>Find your name on the roster</div>
           </button>
-          <button onClick={onAdmin} style={{ background: "transparent", color: COLORS.cream, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 10, padding: "14px 18px", fontSize: 14, cursor: "pointer" }}>
+          <button onClick={onRegister} style={{ textAlign: "left", background: COLORS.pitchLight, color: COLORS.cream, border: "none", borderRadius: 12, padding: "14px 16px", cursor: "pointer" }}>
+            <div style={{ fontSize: 14, fontWeight: 600 }}>New here? Register</div>
+            <div style={{ fontSize: 11, color: "#9BAE9E", marginTop: 2 }}>Needs a quick admin approval</div>
+          </button>
+          <button onClick={onAdmin} style={{ background: "transparent", border: "none", color: "#9BAE9E", fontSize: 12, cursor: "pointer", marginTop: 4 }}>
             Admin dashboard
           </button>
         </div>
@@ -6059,7 +6626,7 @@ function HighlightClipCard({ player, setPlayerVideo, removePlayerVideo, onView }
   );
 }
 
-function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, updateMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing, deleteMarketplaceListing, onMatchLiveStarted, onMatchLiveStopped, onNetsLiveStarted, onNetsLiveStopped }) {
+function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, initialAuthView, activeTeam, pendingRegistrations, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, updateMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing, deleteMarketplaceListing, onMatchLiveStarted, onMatchLiveStopped, onNetsLiveStarted, onNetsLiveStopped }) {
   const [selectedId, setSelectedId] = useState(() => (
     initialSelectedId && players.some((p) => p.id === initialSelectedId) ? initialSelectedId : ""
   ));
@@ -6067,11 +6634,14 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
   const [pinInput, setPinInput] = useState("");
   const [pinConfirm, setPinConfirm] = useState("");
   const [error, setError] = useState("");
-  // fork: "have you played here before?" · login: search/pick + PIN ·
-  // register / registered: existing flow · forgot: PIN-reset request.
-  // Skips straight to "login" when a remembered profile already told us
-  // who this is — no reason to ask the fork question again.
-  const [preAuthView, setPreAuthView] = useState(() => (initialSelectedId ? "login" : "fork"));
+  // login: roster/search + PIN · register / registered: sign-up flow ·
+  // forgot: PIN-reset request · waiting: recognized pending registration
+  // (see the effect below). ModeSelect already asked "sign in or
+  // register" before this ever mounts, so there's no separate fork
+  // screen here re-asking the same question.
+  const [preAuthView, setPreAuthView] = useState(() => (
+    initialSelectedId ? "login" : (initialAuthView === "register" ? "register" : "login")
+  ));
   const [forgotSent, setForgotSent] = useState(false);
   const [regName, setRegName] = useState("");
   const [regPin, setRegPin] = useState("");
@@ -6085,6 +6655,33 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
   // token to this exact request, before there's any player record to
   // attach one to.
   const [pendingRegId, setPendingRegId] = useState(null);
+  const [pendingRegName, setPendingRegName] = useState("");
+
+  // Recognizes "I already registered on this device and I'm still
+  // waiting" — without this, reopening the app before an admin approves
+  // just drops the person back at a blank sign-in with zero memory of
+  // having just registered, which is exactly the kind of thing that made
+  // the old flow feel confusing. approveRegistration carries the pending
+  // request's own id over to become the new player's id directly, so
+  // "does a player with this id exist yet" is a reliable way to tell
+  // approved apart from still-pending apart from rejected/removed.
+  useEffect(() => {
+    const stored = readPendingReg();
+    if (!stored || stored.teamCode !== activeTeam) return;
+    const approved = players.some((p) => p.id === stored.id);
+    if (approved) { clearPendingReg(); return; }
+    const stillPending = pendingRegistrations && pendingRegistrations[stored.id];
+    if (stillPending) {
+      setPendingRegId(stored.id);
+      setPendingRegName(stored.name || "");
+      setPreAuthView("waiting");
+    } else {
+      clearPendingReg(); // rejected, or otherwise no longer pending
+    }
+    // Deliberately mount-once — this is a one-time "did I leave off
+    // mid-registration" check, not something that should re-fire and yank
+    // the screen away if the player has since navigated elsewhere.
+  }, []);
   // The main notifications toggle, shown persistently across every player
   // tab (not just Matches) once signed in — see the w-500 wrapper below.
   const [pushBusy, setPushBusy] = useState(false);
@@ -6113,7 +6710,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
     if (res.ok) setRegPushDone(true);
     else setRegPushError(res.error);
   }
-  const [playerTab, setPlayerTab] = useState("attendance");
+  const [playerTab, setPlayerTab] = useState("home");
   const [selectedDate, setSelectedDate] = useState(() => nextWeekday(tomorrowISO()));
   const [showFullDates, setShowFullDates] = useState(false);
   const [viewingPhoto, setViewingPhoto] = useState(null); // { name, photo, preserveAspect } | null
@@ -6212,6 +6809,24 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
             <div style={{ background: "#FAEEDA", color: "#633806", borderRadius: 10, padding: "10px 14px", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
               <Icon size={13}>🔒</Icon> {monthLabel(activeMonth)} is locked — votes and payments can't be changed right now.
             </div>
+          )}
+          <LiveNowBanner
+            items={computeLiveItems(matches, days)}
+            onJump={(item) => {
+              if (item.type === "match") setPlayerTab("matches");
+              else { setPlayerTab("attendance"); setSelectedDate(item.id); }
+            }}
+          />
+
+          {playerTab === "home" && (
+            <PlayerHomeDashboard
+              matches={matches} days={days} authedPlayer={authedPlayer}
+              subs={subs} monthPayments={monthPayments} activeMonth={activeMonth} rates={rates}
+              marketplace={marketplace}
+              toggleMatchAvailable={toggleMatchAvailable} toggleMatchNotAvailable={toggleMatchNotAvailable}
+              toggleVoteFor={toggleVoteFor} toggleDeclineFor={toggleDeclineFor}
+              onNavigate={setPlayerTab}
+            />
           )}
 
           {playerTab === "attendance" && (
@@ -6455,6 +7070,10 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
         <div style={{ position: "fixed", left: 0, right: 0, bottom: 0, display: "flex", justifyContent: "center", zIndex: 50 }}>
           <div className="w-500" style={{ width: "100%" }}>
             <div style={{ background: COLORS.pitchLight, margin: "0 8px 8px", borderRadius: 16, padding: "8px 4px", display: "flex", justifyContent: "space-around", boxShadow: "0 -2px 12px rgba(0,0,0,0.18)" }}>
+              <button onClick={() => setPlayerTab("home")} style={{ background: "transparent", border: "none", cursor: "pointer", textAlign: "center", color: playerTab === "home" ? COLORS.cream : "#7C8E80", padding: "4px 8px" }}>
+                <div><Icon size={18}>🏠</Icon></div>
+                <div style={{ fontSize: 9, marginTop: 2 }}>Home</div>
+              </button>
               <button onClick={() => setPlayerTab("attendance")} style={{ background: "transparent", border: "none", cursor: "pointer", textAlign: "center", color: playerTab === "attendance" ? COLORS.cream : "#7C8E80", padding: "4px 8px" }}>
                 <div><Icon size={18}>📅</Icon></div>
                 <div style={{ fontSize: 9, marginTop: 2 }}>Attendance</div>
@@ -6483,7 +7102,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
           broadcasterId={authedPlayer.id}
           broadcasterName={authedPlayer.name}
           onClose={() => setShowNetsLiveModal(false)}
-          onStarted={(meetingId) => onNetsLiveStarted(selectedDate, meetingId, authedPlayer.id)}
+          onStarted={(meetingId, isReconnect) => onNetsLiveStarted(selectedDate, meetingId, authedPlayer.id, !isReconnect)}
           onStopped={() => onNetsLiveStopped && onNetsLiveStopped(selectedDate)}
         />
       )}
@@ -6527,33 +7146,36 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
 
   const hasPin = selectedId ? !!pins[selectedId] : false;
 
-  // "Register" and "already a player, just no PIN set yet" read identically
-  // as "I'm new here" otherwise — this makes the actual fork an explicit
-  // choice instead of something inferred from a failed search.
-  if (preAuthView === "fork") {
+  // Recognized via the effect above — this device already registered and
+  // is still waiting on admin approval. Deliberately no "check again"
+  // button: it re-derives from live players/pendingRegistrations props on
+  // every render anyway, so it clears itself the moment approval lands
+  // without needing a manual refresh.
+  if (preAuthView === "waiting") {
     return (
-      <div style={{ minHeight: 480, background: COLORS.pitch, color: COLORS.cream, padding: 24 }}>
-        <button onClick={onBack} style={{ ...iconBtnStyle, marginBottom: 20 }}><Icon size={16}>←</Icon> <span style={{ fontSize: 12, marginLeft: 4 }}>Back</span></button>
-        <div className="w-340" style={{ margin: "0 auto" }}>
-          <div style={{ fontSize: 11, letterSpacing: 3, textTransform: "uppercase", color: COLORS.willow, fontWeight: 600, marginBottom: 6, textAlign: "center" }}>Player Sign-in</div>
-          <div className="scorenum" style={{ fontSize: 28, textAlign: "center", marginBottom: 22 }}>Have you played here before?</div>
-          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-            <button
-              onClick={() => setPreAuthView("login")}
-              style={{ textAlign: "left", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 12, padding: "14px 16px", cursor: "pointer" }}
-            >
-              <div style={{ fontSize: 14, fontWeight: 700 }}>Yes — find my name</div>
-              <div style={{ fontSize: 11.5, opacity: 0.9, marginTop: 2 }}>I'm already on the roster</div>
-            </button>
-            <button
-              onClick={() => { setPreAuthView("register"); setRegError(""); }}
-              style={{ textAlign: "left", background: COLORS.pitchLight, color: COLORS.cream, border: "none", borderRadius: 12, padding: "14px 16px", cursor: "pointer" }}
-            >
-              <div style={{ fontSize: 14, fontWeight: 700 }}>No — I'm new here</div>
-              <div style={{ fontSize: 11.5, color: "#9BAE9E", marginTop: 2 }}>Register (needs admin approval)</div>
-            </button>
-          </div>
+      <div style={{ minHeight: 480, background: COLORS.pitch, color: COLORS.cream, padding: 24, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", textAlign: "center" }}>
+        <div style={{ fontSize: 36, marginBottom: 12 }}>⏳</div>
+        <div className="scorenum" style={{ fontSize: 24, marginBottom: 10 }}>Still waiting</div>
+        <div style={{ fontSize: 13, color: "#CFE0D3", maxWidth: 300, marginBottom: 22 }}>
+          {pendingRegName ? `Hey ${pendingRegName.split(" ")[0]} — you're` : "You're"} all set. Just waiting on your admin to approve you — come back once they have, or turn on notifications below and we'll tell you.
         </div>
+        {pendingRegId && updatePendingRegistrationFcmToken && (
+          <div style={{ maxWidth: 300, marginBottom: 22 }}>
+            {regPushDone ? (
+              <div style={{ fontSize: 12, color: "#B9D9A6" }}>🔔 We'll notify you the moment you're approved.</div>
+            ) : (
+              <>
+                <button onClick={handleRegisterPush} disabled={regPushBusy} style={{ background: "transparent", border: `1px solid ${COLORS.willow}`, color: COLORS.willow, borderRadius: 8, padding: "9px 16px", fontSize: 12.5, fontWeight: 600, cursor: regPushBusy ? "default" : "pointer" }}>
+                  {regPushBusy ? "…" : "🔔 Notify me when I'm approved"}
+                </button>
+                {regPushError && <div style={{ fontSize: 11, color: "#E0A79E", marginTop: 8 }}>{regPushError}</div>}
+              </>
+            )}
+          </div>
+        )}
+        <button onClick={() => { clearPendingReg(); setPreAuthView("login"); }} style={{ background: "transparent", border: "none", color: "#9BAE9E", fontSize: 12, cursor: "pointer" }}>
+          Not you? Sign in as someone else
+        </button>
       </div>
     );
   }
@@ -6595,7 +7217,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
   if (preAuthView === "register") {
     return (
       <RegisterView
-        onBack={() => { setPreAuthView("fork"); setRegError(""); }}
+        onBack={() => { setPreAuthView("login"); setRegError(""); }}
         regName={regName} setRegName={setRegName}
         regPin={regPin} setRegPin={setRegPin}
         regPinConfirm={regPinConfirm} setRegPinConfirm={setRegPinConfirm}
@@ -6604,7 +7226,11 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
         regError={regError} setRegError={setRegError}
         regBusy={regBusy} setRegBusy={setRegBusy}
         submitRegistration={submitRegistration}
-        onSubmitted={(id) => { setPendingRegId(id); setPreAuthView("registered"); }}
+        onSubmitted={(id) => {
+          setPendingRegId(id);
+          writePendingReg({ teamCode: activeTeam, id, name: regName.trim() });
+          setPreAuthView("registered");
+        }}
       />
     );
   }
@@ -6669,7 +7295,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
             <input
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
-              placeholder="Filter by name…"
+              placeholder="Search (optional)…"
               autoFocus
               style={{
                 width: "100%", background: COLORS.pitchLight, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 10,
@@ -6678,18 +7304,13 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
             />
             {(() => {
               const q = searchQuery.trim().toLowerCase();
-              // Nothing renders until there's something to search for — a
-              // full-roster grid is exactly the thing that stops scaling
-              // once a team has more than a handful of players.
-              if (!q) {
-                return (
-                  <div style={{ fontSize: 13, color: "#9BAE9E", textAlign: "center", padding: "20px 6px" }}>
-                    Start typing to find yourself
-                  </div>
-                );
-              }
+              // The roster shows up front now, sorted for easy scanning —
+              // typing filters it, but recognizing your own face/name in a
+              // list shouldn't require typing anything correctly first.
               const MAX_SHOWN = 9;
-              const matches = players.filter((p) => p.name.toLowerCase().includes(q));
+              const matches = q
+                ? players.filter((p) => p.name.toLowerCase().includes(q))
+                : [...players].sort((a, b) => a.name.localeCompare(b.name));
               const shown = matches.slice(0, MAX_SHOWN);
               if (shown.length === 0) {
                 return (
@@ -6717,7 +7338,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
                   </div>
                   {matches.length > shown.length && (
                     <div style={{ fontSize: 11, color: "#9BAE9E", textAlign: "center", marginTop: 8 }}>
-                      {matches.length - shown.length} more match — keep typing to narrow it down
+                      {matches.length - shown.length} more — {q ? "keep typing to narrow it down" : "search by name to find them"}
                     </div>
                   )}
                 </>
@@ -6727,8 +7348,8 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
         )}
 
         <div style={{ textAlign: "center", marginBottom: 20 }}>
-          <button onClick={() => { setPreAuthView("fork"); setSelectedId(""); setSearchQuery(""); }} style={{ background: "transparent", border: "none", color: "#9BAE9E", fontSize: 12, cursor: "pointer" }}>
-            Don't see yourself? ← Back
+          <button onClick={() => { setPreAuthView("register"); setSelectedId(""); setSearchQuery(""); setRegError(""); }} style={{ background: "transparent", border: "none", color: "#9BAE9E", fontSize: 12, cursor: "pointer" }}>
+            Don't see yourself? Register instead →
           </button>
         </div>
 
@@ -6782,6 +7403,123 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
   );
 }
 
+// The Player "Home" tab — "am I sorted?" at a glance. Every action here
+// calls the exact same handler the Matches/Attendance/Subscription tabs
+// already use — this doesn't own any state of its own, it's a different
+// front door onto data that already exists. The live-broadcast banner
+// isn't repeated here — it's already shown above every player tab.
+function PlayerHomeDashboard({ matches, days, authedPlayer, subs, monthPayments, activeMonth, rates, marketplace, toggleMatchAvailable, toggleMatchNotAvailable, toggleVoteFor, toggleDeclineFor, onNavigate }) {
+  const today = todayISO();
+  const upcomingMatches = Object.values(matches || {}).filter((m) => m.date && m.date >= today).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const nextMatch = upcomingMatches[0] || null;
+  const matchAvailable = nextMatch ? (nextMatch.available || []).includes(authedPlayer.id) : false;
+  const matchWaitlisted = nextMatch ? (nextMatch.waitlist || []).includes(authedPlayer.id) : false;
+  const matchNotAvailable = nextMatch ? (nextMatch.notAvailable || []).includes(authedPlayer.id) : false;
+
+  const nextNetsIso = nextWeekday(today);
+  const nextNetsData = days[nextNetsIso] || { votes: [], declined: [] };
+  const netsAvailable = (nextNetsData.votes || []).includes(authedPlayer.id);
+  const netsNotAvailable = (nextNetsData.declined || []).includes(authedPlayer.id);
+
+  const monthSubPlayers = subs[activeMonth] || [];
+  const subbed = monthSubPlayers.includes(authedPlayer.id);
+  const paid = !!(monthPayments && monthPayments[authedPlayer.id]);
+
+  const myListings = Object.values(marketplace || {}).filter((l) => l.status === "active" && l.posterId === authedPlayer.id);
+  const myInterest = Object.values(marketplace || {}).filter((l) => l.status === "active" && (l.interested || []).includes(authedPlayer.id));
+
+  function statusPill(available, waitlisted, notAvailable) {
+    if (available) return { bg: "#EAF3E4", color: "#3B6D11", text: "✓ You: Available" };
+    if (waitlisted) return { bg: "#F6E9D2", color: "#8A5A17", text: "You: Waitlisted" };
+    if (notAvailable) return { bg: "#F5E1DC", color: "#9A3634", text: "✕ You: Not Available" };
+    return { bg: "#EEEAD9", color: COLORS.inkSoft, text: "No response yet" };
+  }
+  const matchPill = statusPill(matchAvailable, matchWaitlisted, matchNotAvailable);
+  const netsPill = statusPill(netsAvailable, false, netsNotAvailable);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      {nextMatch && (
+        <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16 }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4 }}>
+            Next match · {cleanField(nextMatch.groundName, "Ground TBD")}, {fmtDateShort(nextMatch.date)}
+          </div>
+          <span style={{ display: "inline-block", fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20, background: matchPill.bg, color: matchPill.color, marginBottom: 10 }}>{matchPill.text}</span>
+          <div style={{ display: "flex", gap: 8 }}>
+            <button
+              onClick={() => toggleMatchAvailable(nextMatch.id, authedPlayer.id)}
+              style={{ flex: 1, fontSize: 12, fontWeight: 600, padding: "9px 4px", borderRadius: 8, cursor: "pointer", border: `1px solid ${matchAvailable || matchWaitlisted ? COLORS.willow : COLORS.line}`, background: matchAvailable || matchWaitlisted ? COLORS.willow : "transparent", color: matchAvailable || matchWaitlisted ? "#fff" : COLORS.ink }}
+            >
+              Available
+            </button>
+            <button
+              onClick={() => toggleMatchNotAvailable(nextMatch.id, authedPlayer.id)}
+              style={{ flex: 1, fontSize: 12, fontWeight: 600, padding: "9px 4px", borderRadius: 8, cursor: "pointer", border: `1px solid ${matchNotAvailable ? COLORS.leather : COLORS.line}`, background: matchNotAvailable ? COLORS.leather : "transparent", color: matchNotAvailable ? "#fff" : COLORS.ink }}
+            >
+              Not Available
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16 }}>
+        <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4 }}>
+          Next nets · {dayOfWeekName(nextNetsIso)}, {fmtDateShort(nextNetsIso)}
+        </div>
+        <span style={{ display: "inline-block", fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20, background: netsPill.bg, color: netsPill.color, marginBottom: 10 }}>{netsPill.text}</span>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button
+            onClick={() => toggleVoteFor(nextNetsIso, authedPlayer.id)}
+            style={{ flex: 1, fontSize: 12, fontWeight: 600, padding: "9px 4px", borderRadius: 8, cursor: "pointer", border: `1px solid ${netsAvailable ? COLORS.willow : COLORS.line}`, background: netsAvailable ? COLORS.willow : "transparent", color: netsAvailable ? "#fff" : COLORS.ink }}
+          >
+            Available
+          </button>
+          <button
+            onClick={() => toggleDeclineFor(nextNetsIso, authedPlayer.id)}
+            style={{ flex: 1, fontSize: 12, fontWeight: 600, padding: "9px 4px", borderRadius: 8, cursor: "pointer", border: `1px solid ${netsNotAvailable ? COLORS.leather : COLORS.line}`, background: netsNotAvailable ? COLORS.leather : "transparent", color: netsNotAvailable ? "#fff" : COLORS.ink }}
+          >
+            Not Available
+          </button>
+        </div>
+      </div>
+
+      <div onClick={() => onNavigate("subscription")} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, cursor: "pointer" }}>
+        <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>This month's dues</div>
+        {!subbed ? (
+          <div style={{ fontSize: 12.5, color: COLORS.inkSoft }}>Not subscribed this month</div>
+        ) : (
+          <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+            <span style={{ fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20, background: paid ? "#EAF3E4" : "#F5E1DC", color: paid ? "#3B6D11" : "#9A3634" }}>{paid ? "✓ Paid" : "Unpaid"}</span>
+            {!paid && <span className="scorenum" style={{ fontSize: 18 }}>{fmtINR(rates.subAmount || 0)}</span>}
+          </div>
+        )}
+      </div>
+
+      {(myListings.length > 0 || myInterest.length > 0) && (
+        <div onClick={() => onNavigate("gear")} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, cursor: "pointer" }}>
+          <div style={{ fontSize: 11.5, fontWeight: 700, letterSpacing: 0.3, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>Your Gear activity</div>
+          {myListings.map((l) => (
+            <div key={l.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "5px 0" }}>
+              <span>🏏 Your listing: {l.title || l.category}</span>
+              <span style={{ color: "#3B6D11" }}>{(l.interested || []).length} interested</span>
+            </div>
+          ))}
+          {myInterest.map((l) => (
+            <div key={l.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12.5, padding: "5px 0" }}>
+              <span>You're interested in</span>
+              <span style={{ color: COLORS.inkSoft }}>{l.title || l.category}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* No quick-links grid here — Attendance/Subscription/Matches/Gear
+          are already one tap away in the bottom bar, always visible, so
+          repeating them as a second set of buttons would just be the same
+          four destinations twice for no reason. */}
+    </div>
+  );
+}
 function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, photos, onViewPhoto, onViewClip, paymentDefault, uploadMatchProof, removeMatchProof, onMatchLiveStarted, onMatchLiveStopped, teamName }) {
   const matchList = Object.values(matches || {}).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   const canPayInline = isMobileDevice();
@@ -7383,7 +8121,7 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
         broadcasterId={authedPlayer.id}
         broadcasterName={authedPlayer.name}
         onClose={() => setLiveModalMatchId(null)}
-        onStarted={(meetingId) => onMatchLiveStarted(liveModalMatchId, meetingId, authedPlayer.id)}
+        onStarted={(meetingId, isReconnect) => onMatchLiveStarted(liveModalMatchId, meetingId, authedPlayer.id, !isReconnect)}
         onStopped={() => onMatchLiveStopped && onMatchLiveStopped(liveModalMatchId)}
       />
     )}
@@ -7680,7 +8418,7 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
           broadcasterId={null}
           broadcasterName={teamName || "Admin"}
           onClose={() => setShowLiveModal(false)}
-          onStarted={(meetingId) => onNetsLiveStarted(selectedDate, meetingId, null)}
+          onStarted={(meetingId, isReconnect) => onNetsLiveStarted(selectedDate, meetingId, null, !isReconnect)}
           onStopped={() => onNetsLiveStopped && onNetsLiveStopped(selectedDate)}
         />
       )}
@@ -10053,7 +10791,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
         broadcasterId={null}
         broadcasterName={teamName || "Admin"}
         onClose={() => setShowLiveModal(false)}
-        onStarted={(meetingId) => onMatchLiveStarted(match.id, meetingId, null)}
+        onStarted={(meetingId, isReconnect) => onMatchLiveStarted(match.id, meetingId, null, !isReconnect)}
         onStopped={() => onMatchLiveStopped && onMatchLiveStopped(match.id)}
       />
     )}
