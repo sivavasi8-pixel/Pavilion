@@ -11,6 +11,9 @@
 //    UPI id, and payee name are looked up here from Firestore rather than
 //    riding along in the URL, so the link isn't the whole message's worth
 //    of query string when it lands as visible text in WhatsApp.
+//    /m/:token + /banner-image do the same for a match's uploaded banner —
+//    the availability message links to /m/:token so WhatsApp shows the
+//    poster as a card.
 //    /qr-image-sub and /sp/:token are the same trick for nets-fee
 //    subscription payments instead of a match — /sp/:token carries
 //    team+monthKey (there's no match to point at), and the amount comes
@@ -427,6 +430,152 @@ async function handlePayCard(url, env, token) {
   return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
 }
 
+// The published app's address — where the tap-through page's "Open
+// Pavilion" button goes. Fixed rather than derived because this Worker
+// lives on a different origin (workers.dev) from the app (web.app).
+const APP_URL = "https://cricket-nets-tracker.web.app/";
+const SAFE_ID = /^[A-Za-z0-9_-]+$/;
+
+// A match's uploaded banner as a real fetchable image — the same job
+// handleQrImage does for payment QRs. Banners live in their own
+// photo_banner_<matchId> document (see matchBannerKey in index.html), so
+// this works even for a match that's since been moved into an archive
+// year and no longer appears in the live matches document.
+async function handleBannerImage(url, env) {
+  const team = url.searchParams.get("team");
+  const matchId = url.searchParams.get("match");
+  if (!team || !matchId || !SAFE_ID.test(team) || !SAFE_ID.test(matchId)) return new Response("Missing or bad team/match", { status: 400 });
+
+  const serviceAccount = loadServiceAccount(env);
+  if (!serviceAccount) return new Response("Server misconfigured", { status: 500 });
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(serviceAccount, ["https://www.googleapis.com/auth/datastore"]);
+  } catch (e) {
+    return new Response("Auth failed: " + e.message, { status: 500 });
+  }
+
+  const dataUrl = await firestoreGetValue(serviceAccount.project_id, accessToken, `${team}__photo_banner_${matchId}`);
+  if (!dataUrl || !dataUrl.startsWith("data:")) return new Response("Not found", { status: 404 });
+
+  const parsed = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+  if (!parsed) return new Response("Bad image data", { status: 500 });
+  const binary = atob(parsed[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Response(bytes, { headers: { "Content-Type": parsed[1], "Cache-Control": "public, max-age=3600" } });
+}
+
+// "07:00" -> "7:00 AM". Anything else (an older free-text time like
+// "11:30 AM") passes through unchanged — same rule index.html's
+// formatTimeDisplay uses.
+function formatMatchTime(value) {
+  const s = String(value || "").trim();
+  const m = /^([01]?\d|2[0-3]):([0-5]\d)$/.exec(s);
+  if (!m) return s;
+  let h = Number(m[1]);
+  const ampm = h >= 12 ? "PM" : "AM";
+  h = h % 12 || 12;
+  return `${h}:${m[2]} ${ampm}`;
+}
+
+// The link that goes in the availability WhatsApp message — /m/<token>
+// with token = base64url("team:matchId"), same shape as /p/<token>. Its
+// og:image is the match's banner, so WhatsApp builds a card with the
+// poster as the picture; tapping it lands on the page below (full banner,
+// the essentials, and a way into the app).
+async function handleMatchCard(url, env, token) {
+  let team = "";
+  let matchId = "";
+  try {
+    const decoded = base64UrlDecode(token);
+    const sep = decoded.indexOf(":");
+    if (sep === -1) throw new Error("bad token");
+    team = decoded.slice(0, sep);
+    matchId = decoded.slice(sep + 1);
+  } catch {
+    return new Response("Bad link", { status: 400 });
+  }
+  if (!team || !matchId || !SAFE_ID.test(team) || !SAFE_ID.test(matchId)) return new Response("Bad link", { status: 400 });
+
+  const serviceAccount = loadServiceAccount(env);
+  if (!serviceAccount) return new Response("Server misconfigured", { status: 500 });
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(serviceAccount, ["https://www.googleapis.com/auth/datastore"]);
+  } catch (e) {
+    return new Response("Auth failed: " + e.message, { status: 500 });
+  }
+
+  const projectId = serviceAccount.project_id;
+  const [matchesRaw, teamsIndexRaw] = await Promise.all([
+    firestoreGetValue(projectId, accessToken, `${team}__matches`),
+    firestoreGetValue(projectId, accessToken, "teamsIndex"),
+  ]);
+
+  let match = null;
+  try { match = (matchesRaw ? JSON.parse(matchesRaw) : {})[matchId] || null; } catch { match = null; }
+  let teamName = "Pavilion";
+  try {
+    const idx = teamsIndexRaw ? JSON.parse(teamsIndexRaw) : {};
+    if (idx[team] && idx[team].teamName) teamName = idx[team].teamName;
+  } catch {
+    // keep the default name
+  }
+
+  // A match that's been archived or deleted since the message went out
+  // still has its banner, so the card degrades to just the picture and the
+  // team name instead of erroring.
+  const title = match ? `${match.matchType || "Match"} — ${match.groundName || "TBD"}` : `${teamName} match`;
+  const dateText = match && match.date
+    ? new Date(match.date + "T00:00:00Z").toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short", year: "numeric", timeZone: "UTC" })
+    : "";
+  const timeText = match ? formatMatchTime(match.time) : "";
+  const when = [dateText, timeText].filter(Boolean).join(" · ");
+  const details = match
+    ? [when, match.overs ? `${match.overs} overs` : "", match.ballType || "", match.groundName || ""].filter(Boolean)
+    : [];
+
+  const imageUrl = `${url.origin}/banner-image?team=${encodeURIComponent(team)}&match=${encodeURIComponent(matchId)}`;
+  const appLink = `${APP_URL}?team=${encodeURIComponent(team)}`;
+  const description = when ? `${when} — tap to view` : "Tap to view";
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="${escapeHtml(description)}">
+<meta property="og:image" content="${imageUrl}">
+<meta property="og:type" content="website">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #16301F; color: #F3EEDF; margin: 0; padding: 16px; display: flex; flex-direction: column; align-items: center; }
+  .card { width: 100%; max-width: 420px; }
+  img { width: 100%; height: auto; border-radius: 12px; display: block; background: #1F4530; }
+  h1 { font-size: 20px; margin: 16px 0 6px; }
+  .meta { font-size: 14px; color: #B7C4B8; line-height: 1.6; }
+  a.btn { background: #C08A45; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; display: block; text-align: center; margin-top: 18px; }
+  .team { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: #C08A45; font-weight: 700; margin-top: 4px; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <img src="${imageUrl}" alt="Match banner" />
+    <div class="team">${escapeHtml(teamName)}</div>
+    <h1>${escapeHtml(title)}</h1>
+    <div class="meta">${details.map(escapeHtml).join("<br>")}</div>
+    <a class="btn" href="${appLink}">Open Pavilion to confirm</a>
+  </div>
+</body>
+</html>`;
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
 // Same job as handlePayCard above, for nets-fee/subscription payments.
 // token is base64url("team:monthKey") instead of "team:matchId" — a
 // subscription doesn't have a match to point at, just a team and which
@@ -742,6 +891,8 @@ export default {
       const url = new URL(request.url);
       if (url.pathname === "/qr-image") return await handleQrImage(url, env);
       if (url.pathname === "/qr-image-sub") return await handleSubQrImage(url, env);
+      if (url.pathname === "/banner-image") return await handleBannerImage(url, env);
+      if (url.pathname.startsWith("/m/")) return await handleMatchCard(url, env, url.pathname.slice(3));
       if (url.pathname.startsWith("/p/")) return await handlePayCard(url, env, url.pathname.slice(3));
       if (url.pathname.startsWith("/sp/")) return await handleSubPayCard(url, env, url.pathname.slice(4));
       if (url.pathname === "/live/start") return await handleLiveStart(request, env);

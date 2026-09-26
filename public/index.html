@@ -1459,6 +1459,17 @@ function buildPayCardUrl(match) {
   const token = btoa(`${team}:${match.id}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   return `${PUSH_WORKER_URL}/p/${token}`;
 }
+// Same trick again for a match's uploaded banner — the Worker's /m/:token
+// route turns it into a WhatsApp card with the poster as its picture.
+// null when the match has no banner, so those keep sending exactly the
+// message they always did.
+function buildMatchCardUrl(match) {
+  const team = window.__activeTeam;
+  if (!team || !match || !match.id || !match.hasBanner) return null;
+  if (!PUSH_WORKER_URL || PUSH_WORKER_URL.startsWith("PASTE_")) return null;
+  const token = btoa(`${team}:${match.id}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `${PUSH_WORKER_URL}/m/${token}`;
+}
 // Same trick as buildPayCardUrl above, for nets-fee subscription
 // payments — the Worker's /sp/:token route (not /p/:token — there's no
 // match here, just a team and which month this is for).
@@ -1645,6 +1656,14 @@ function buildMatchAvailabilityMessage(match, players) {
   const waitlistPlayers = (match.waitlist || []).map((id) => players.find((p) => p.id === id)).filter(Boolean);
   const out = [];
   out.push(`🏏 *${cleanField(match.matchType, "Match")} — ${cleanField(match.groundName, "TBD")}*`);
+  // Must come before the Location link below: WhatsApp builds its preview
+  // card from the first link in a message, and that's this one only if it
+  // sits above the Google Maps URL.
+  const bannerCardUrl = buildMatchCardUrl(match);
+  if (bannerCardUrl) {
+    out.push("");
+    out.push(bannerCardUrl);
+  }
   out.push("");
   out.push("Hi Team, please confirm your availability:");
   out.push("");
