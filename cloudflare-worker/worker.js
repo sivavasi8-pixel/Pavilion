@@ -541,6 +541,15 @@ async function handleMatchCard(url, env, token) {
   const imageUrl = `${url.origin}/banner-image?team=${encodeURIComponent(team)}&match=${encodeURIComponent(matchId)}`;
   const appLink = `${APP_URL}?team=${encodeURIComponent(team)}`;
   const description = when ? `${when} — tap to view` : "Tap to view";
+  // The Location line in the availability message carries this card's link
+  // instead of the raw Maps URL (WhatsApp always shows a link's text, so
+  // one link does both jobs), and tapping it still has to end up at the
+  // ground like the Maps link always did. Redirected in the page, not with
+  // an HTTP 302: WhatsApp's fetcher follows redirects, so a 302 would make
+  // it preview Google Maps and the banner card would never appear. It only
+  // reads this page's meta tags and doesn't run its script, so people
+  // bounce to the location and the card keeps its banner.
+  const locationUrl = match && /^https?:\/\//i.test(String(match.locationUrl || "").trim()) ? String(match.locationUrl).trim() : "";
 
   const html = `<!DOCTYPE html>
 <html>
@@ -559,6 +568,7 @@ async function handleMatchCard(url, env, token) {
   h1 { font-size: 20px; margin: 16px 0 6px; }
   .meta { font-size: 14px; color: #B7C4B8; line-height: 1.6; }
   a.btn { background: #C08A45; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; display: block; text-align: center; margin-top: 18px; }
+  a.btn2 { color: #B7C4B8; text-decoration: underline; display: block; text-align: center; margin-top: 12px; font-size: 13px; }
   .team { font-size: 11px; letter-spacing: 2px; text-transform: uppercase; color: #C08A45; font-weight: 700; margin-top: 4px; }
 </style>
 </head>
@@ -568,8 +578,12 @@ async function handleMatchCard(url, env, token) {
     <div class="team">${escapeHtml(teamName)}</div>
     <h1>${escapeHtml(title)}</h1>
     <div class="meta">${details.map(escapeHtml).join("<br>")}</div>
-    <a class="btn" href="${appLink}">Open Pavilion to confirm</a>
+    ${locationUrl
+      ? `<a class="btn" href="${escapeHtml(locationUrl)}">Open location</a>
+    <a class="btn2" href="${appLink}">Open Pavilion to confirm</a>`
+      : `<a class="btn" href="${appLink}">Open Pavilion to confirm</a>`}
   </div>
+  ${locationUrl ? `<script>location.replace(${JSON.stringify(locationUrl).replace(/</g, "\\u003c")});</script>` : ""}
 </body>
 </html>`;
 
