@@ -43,7 +43,7 @@ service cloud.firestore {
                         docId in ['teamsIndex', 'pinResetRequests']
                         ||
                         docId.matches(
-                          '^[a-z0-9-]+__(players|subs|days|pins|payments|adminPin|rates|adjustments|lockedMonths|weekendExceptions|pendingRegistrations|matches|paymentDefault|playerPinResetRequests|adminNotify|marketplace)$'
+                          '^[a-z0-9-]+__(players|subs|days|pins|payments|adminPin|rates|adjustments|lockedMonths|weekendExceptions|pendingRegistrations|matches|paymentDefault|subscriptionPaymentDefault|playerPinResetRequests|adminNotify|marketplace|teamPhotoIds)$'
                         )
                         ||
                         docId.matches('^[a-z0-9-]+__photo_.*$')

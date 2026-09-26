@@ -239,6 +239,32 @@ function Icon({ children, size = 14, color }) {
     </span>
   );
 }
+// Compact header bell — replaces the old "🔔 Notifications" card that used
+// to repeat at the top of every single tab in both the admin and player
+// views. Same on/off/busy states and the same tap-to-toggle behavior as
+// that card's button, just relocated so it shows once, always reachable.
+// A failed permission request shows as a small red dot rather than eating
+// permanent space; the caller still owns surfacing the actual error text
+// (as a slim banner) wherever fits that header.
+function NotificationBell({ enabled, busy, error, onToggle, title }) {
+  return (
+    <button
+      onClick={onToggle}
+      disabled={busy}
+      title={title}
+      style={{
+        position: "relative", display: "flex", alignItems: "center", justifyContent: "center",
+        width: 34, height: 34, borderRadius: 8, border: "none", cursor: busy ? "default" : "pointer",
+        background: enabled ? "#3B7A3E" : COLORS.pitchLight, opacity: busy ? 0.7 : 1, flexShrink: 0,
+      }}
+    >
+      <Icon size={16} color="#fff">{busy ? "…" : "🔔"}</Icon>
+      {error && !busy && (
+        <span style={{ position: "absolute", top: -2, right: -2, width: 9, height: 9, borderRadius: "50%", background: "#D9534F", border: `2px solid ${COLORS.pitch}` }} />
+      )}
+    </button>
+  );
+}
 // The one place every "Share via WhatsApp" button's look lives — each call
 // site only needs to hand over the message text, plus whatever spacing it
 // needs to sit next to its own Copy button (flex:1 in a button row, a
@@ -493,7 +519,7 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
             </button>
             <button
               onClick={handleFullscreen}
-              title="Full screen"
+              title="Full screen" aria-label="Full screen"
               style={{ background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: "50%", width: 28, height: 28, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
             >
               ⛶
@@ -501,7 +527,7 @@ function LiveViewer({ meetingId, viewerId, viewerName }) {
             {pipSupported && (
               <button
                 onClick={handlePiP}
-                title="Picture in picture"
+                title="Picture in picture" aria-label="Picture in picture"
                 style={{ background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", borderRadius: "50%", width: 28, height: 28, fontSize: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}
               >
                 🖼️
@@ -1043,7 +1069,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
               {torchOn !== null && (
                 <button
                   onClick={handleToggleTorch}
-                  title="Flashlight"
+                  title="Flashlight" aria-label="Flashlight"
                   style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: torchOn ? COLORS.willow : "rgba(0,0,0,0.5)", color: "#fff", cursor: "pointer", fontSize: 13, display: "flex", alignItems: "center", justifyContent: "center" }}
                 >
                   🔦
@@ -1058,7 +1084,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
               </button>
               <button
                 onClick={handleFullscreen}
-                title="Full screen"
+                title="Full screen" aria-label="Full screen"
                 style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.5)", color: "#fff", cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center" }}
               >
                 ⛶
@@ -1066,7 +1092,7 @@ function LiveBroadcastModal({ onClose, onStarted, onStopped, matchLabel, broadca
               {pipSupported && (
                 <button
                   onClick={handlePiP}
-                  title="Picture in picture"
+                  title="Picture in picture" aria-label="Picture in picture"
                   style={{ width: 28, height: 28, borderRadius: "50%", border: "none", background: "rgba(0,0,0,0.5)", color: "#fff", cursor: "pointer", fontSize: 12, display: "flex", alignItems: "center", justifyContent: "center" }}
                 >
                   🖼️
@@ -1218,6 +1244,15 @@ function monthLabel(key) {
   const [y, m] = key.split("-").map(Number);
   return new Date(y, m - 1, 1).toLocaleDateString("en-IN", { month: "long", year: "numeric" });
 }
+// Pure version of the year-rollover math shiftMonth() already does
+// stateful navigation with — needed here just to name next month in the
+// settlement message, not to actually change what month's being viewed.
+function nextMonthKey(key) {
+  let [y, m] = key.split("-").map(Number);
+  m += 1;
+  if (m === 13) { m = 1; y += 1; }
+  return `${y}-${String(m).padStart(2, "0")}`;
+}
 function daysInMonth(key) {
   const [y, m] = key.split("-").map(Number);
   return new Date(y, m, 0).getDate();
@@ -1231,6 +1266,12 @@ function tomorrowISO() {
   d.setDate(d.getDate() + 1);
   return toISO(d);
 }
+function isoDateDaysAgo(days) {
+  const d = new Date();
+  d.setDate(d.getDate() - days);
+  return toISO(d);
+}
+const MATCH_ARCHIVE_RETENTION_DAYS = 90;
 function fmtDateShort(iso) {
   const d = new Date(iso + "T00:00:00");
   return d.toLocaleDateString("en-IN", { weekday: "short", day: "2-digit", month: "short" });
@@ -1361,6 +1402,32 @@ function buildUpiDeepLink({ upiId, amount, payeeName, note }) {
   if (note) params.set("tn", note);
   return `upi://pay?${params.toString()}`;
 }
+// Builds a Google Calendar "add event" link — no backend, no OAuth, same
+// "generate a deep link, let the OS/browser handle it" shape as
+// buildUpiDeepLink above. Scoped to matches only, not nets days: a match
+// already has a real date+time field, but nets sessions only ever record
+// hours *after* the fact (for fee calc), with no scheduled start time
+// anywhere in the data model — inventing one here would just be a guess.
+// Calendar events need an explicit end time, which matches don't record
+// either, so this defaults to a 2-hour block from the scheduled start —
+// long enough to cover a typical weekend match without adding a new
+// duration field just for this.
+function buildMatchCalendarLink(match, teamName) {
+  if (!match || !match.date) return null;
+  const timePart = /^([01]?\d|2[0-3]):([0-5]\d)$/.test(match.time || "") ? match.time : "09:00";
+  const start = new Date(`${match.date}T${timePart}:00`);
+  if (Number.isNaN(start.getTime())) return null;
+  const end = new Date(start.getTime() + 2 * 60 * 60 * 1000);
+  const fmtUtc = (d) => d.toISOString().replace(/[-:]/g, "").split(".")[0] + "Z";
+  const params = new URLSearchParams({
+    action: "TEMPLATE",
+    text: `${cleanField(match.matchType, "Match")} · ${cleanField(match.groundName, "Ground TBD")}`,
+    dates: `${fmtUtc(start)}/${fmtUtc(end)}`,
+  });
+  if (match.groundName) params.set("location", match.groundName);
+  params.set("details", `${teamName ? teamName + " — " : ""}via Pavilion`);
+  return `https://calendar.google.com/calendar/render?${params.toString()}`;
+}
 // Opens WhatsApp — the app on a phone, WhatsApp Web on desktop — with the
 // message already typed in, then leaves picking who receives it (a person
 // or a group) to WhatsApp's own chat list. There's no API, official or
@@ -1392,6 +1459,16 @@ function buildPayCardUrl(match) {
   const token = btoa(`${team}:${match.id}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
   return `${PUSH_WORKER_URL}/p/${token}`;
 }
+// Same trick as buildPayCardUrl above, for nets-fee subscription
+// payments — the Worker's /sp/:token route (not /p/:token — there's no
+// match here, just a team and which month this is for).
+function buildSubPayCardUrl(monthKeyStr) {
+  const team = window.__activeTeam;
+  if (!team || !monthKeyStr) return null;
+  if (!PUSH_WORKER_URL || PUSH_WORKER_URL.startsWith("PASTE_")) return null;
+  const token = btoa(`${team}:${monthKeyStr}`).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  return `${PUSH_WORKER_URL}/sp/${token}`;
+}
 // Turns a data: URL (how every image in this app is already stored) into
 // a real File the native share sheet can attach — data: URLs themselves
 // aren't shareable, only actual file/blob objects are.
@@ -1421,6 +1498,77 @@ function computePlayedIds(match) {
     return availableIds.filter((id) => match.played.includes(id));
   }
   return availableIds;
+}
+// ---- Match dues ----
+// Who still owes for a match: players who are playing, on a match that has
+// a total cost set. Same split toggleMatchPaid and the match card use
+// (totalCost / everyone who played), and a payment counts as recorded when
+// the key exists (toggleMatchPaid stores the amount, deletes it to unmark).
+// knownIds (optional) skips ids no longer on the roster, so a removed
+// player's share can't hold a match open forever.
+function matchUnpaidIds(match, knownIds) {
+  if (match.status === "cancelled") return [];
+  if ((Number(match.totalCost) || 0) <= 0) return [];
+  const payments = match.payments || {};
+  return computePlayedIds(match).filter((id) => (!knownIds || knownIds.has(id)) && payments[id] == null);
+}
+function matchLabelForDues(m) {
+  return `${m.date ? fmtDateShort(m.date) : "No date"} · ${cleanField(m.groundName, "Ground TBD")}`;
+}
+// One pass over the live matches: `open` = matches that still have at
+// least one unpaid player, `byPlayer` = the same data pivoted per player
+// (paid entries included so a mistaken Mark paid can be undone in place),
+// `feeNotSet` = matches with players but no total cost yet.
+function computeMatchDues(matches, players) {
+  const known = new Set(players.map((p) => p.id));
+  const nameOf = {};
+  players.forEach((p) => { nameOf[p.id] = p.name; });
+  const list = Object.values(matches || {}).filter((m) => m.status !== "cancelled").sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const open = [];
+  const feeNotSet = [];
+  const byPlayerMap = {};
+  list.forEach((m) => {
+    const played = computePlayedIds(m);
+    const playedKnown = played.filter((id) => known.has(id));
+    if (playedKnown.length === 0) return;
+    const cost = Number(m.totalCost) || 0;
+    if (cost <= 0) { feeNotSet.push(m); return; }
+    const fee = cost / played.length;
+    const unpaid = matchUnpaidIds(m, known);
+    if (unpaid.length === 0) return;
+    open.push({ match: m, fee, label: matchLabelForDues(m), playedIds: playedKnown, unpaidIds: unpaid });
+    playedKnown.forEach((id) => {
+      const paid = (m.payments || {})[id] != null;
+      if (!byPlayerMap[id]) byPlayerMap[id] = { id, name: nameOf[id], items: [] };
+      byPlayerMap[id].items.push({ match: m, fee, label: matchLabelForDues(m), paid });
+    });
+  });
+  const byPlayer = Object.values(byPlayerMap).map((r) => ({
+    ...r, total: r.items.filter((i) => !i.paid).reduce((s, i) => s + i.fee, 0),
+  })).sort((a, b) => b.total - a.total || a.name.localeCompare(b.name));
+  const totalPending = byPlayer.reduce((s, r) => s + r.total, 0);
+  return { open, byPlayer, feeNotSet, totalPending, owingCount: byPlayer.filter((r) => r.total > 0).length };
+}
+function buildMatchDuesMessage(dues) {
+  const lines = ["🏏 *Match dues — pending*", ""];
+  const owing = dues.byPlayer.filter((r) => r.total > 0);
+  if (owing.length === 0) {
+    lines.push("Everyone's paid up for matches. Nothing pending! 🙌");
+  } else {
+    owing.forEach((r) => {
+      lines.push(`⏳ *${r.name}* — ${fmtINR(r.total)}`);
+      r.items.filter((i) => !i.paid).forEach((i) => lines.push(`   • ${i.label}: ${fmtINR(i.fee)}`));
+    });
+    lines.push("—————————————", `Total pending: ${fmtINR(dues.totalPending)}`, "", "Please pay and update as paid against your name. Thanks!");
+  }
+  return lines.join("\n");
+}
+function buildMatchDuesCSV(dues) {
+  const lines = [["Player", "Match", "Date", "Fee", "Status"].join(",")];
+  dues.byPlayer.forEach((r) => r.items.forEach((i) => {
+    lines.push([csvCell(r.name), csvCell(i.label), i.match.date || "", Math.round(i.fee * 100) / 100, i.paid ? "PAID" : "UNPAID"].join(","));
+  }));
+  return lines.join("\n");
 }
 // Shared between CricketNetsTracker (which uploads/loads the image under
 // this key) and MatchCard / PlayerMatchesView (which look it up in
@@ -1461,6 +1609,20 @@ function marketplacePhotoKeys(listing) {
   if (listing.hasPhoto) return [marketplacePhotoKey(listing.id)];
   return [];
 }
+// Same "small ordered list + one photo_ document per image" split as
+// marketplacePhotoKeyN above, for the rotating team-photo banner —
+// teamPhotoIds (in CricketNetsTracker's own state) holds just the ids in
+// display order; this is only ever used to turn one of those ids into the
+// photo_ key its image data actually lives under.
+function teamPhotoKey(photoId) {
+  return `team_photo_${photoId}`;
+}
+const TEAM_PHOTOS_MAX = 8;
+const TEAM_PHOTO_INTERVAL_MS = 5000;
+// 16:9 — a wide "hero" shape that reads well as a full-width rotating
+// banner, unlike the 4:5 portrait crop match banners use.
+const TEAM_PHOTO_CROP_W = 960;
+const TEAM_PHOTO_CROP_H = 540;
 // WhatsApp messages are read on phones far more than desktops, and a chat
 // bubble is nowhere near wide enough for a padded/aligned "table" (36
 // monospace characters) to fit on one line — it wraps mid-row, right in
@@ -1515,6 +1677,36 @@ function buildMatchAvailabilityMessage(match, players) {
   }
   return out.join("\n");
 }
+// A day-before "here's what you need to know" reminder — deliberately not
+// the same message as buildMatchAvailabilityMessage above, which is for
+// asking people to vote and lists everyone's RSVP status. This one goes
+// out once the squad's already settled, so it skips the roster entirely
+// and just states the logistics, in the same voice an admin would
+// actually type this by hand: ball type explains dress code in one
+// sentence ("it's red ball, so whites") rather than as two separate
+// labeled facts.
+function buildMatchReminderMessage(match) {
+  const availableCount = (match.available || []).length;
+  const ballWord = match.ballType === "Leather Red" ? "red ball" : match.ballType === "Leather White" ? "white ball" : "";
+  const jerseyWord = match.jersey === "Whites" ? "whites" : match.jersey === "Color" ? "colour jersey" : cleanField(match.jersey, "");
+  const ground = cleanField(match.groundName, "the ground");
+  const out = [];
+  out.push("Hi Team! 🏏");
+  out.push("");
+  if (ballWord && jerseyWord) {
+    out.push(`Tomorrow's match at ${ground} is a ${ballWord} game — please come in ${jerseyWord}.`);
+  } else if (jerseyWord) {
+    out.push(`Tomorrow's match at ${ground} — please come in ${jerseyWord}.`);
+  } else {
+    out.push(`Tomorrow's match is at ${ground}.`);
+  }
+  out.push("");
+  out.push(match.time ? `Match starts at ${formatTimeDisplay(match.time)} — please reach on time!` : "Please reach on time!");
+  if (match.locationUrl) out.push(`📍 ${match.locationUrl}`);
+  out.push("");
+  out.push(`See you all ${availableCount} there! 🙌`);
+  return out.join("\n");
+}
 // Fixed categories rather than free-form entries — keeps recognition
 // consistent match to match, and each is independently optional (a
 // two-performer match, or just a Player of the Match with nothing else,
@@ -1524,19 +1716,10 @@ const PERFORMER_CATEGORIES = [
   { key: "bestBatting", label: "Best Batting", icon: "🏏" },
   { key: "bestBowling", label: "Best Bowling", icon: "🎯" },
 ];
-// A pool of warm openers/closers so the congratulations message doesn't
-// read as the exact same robotic line every single week — one pair picked
-// at random each time the message is built. The performer details
-// themselves (name, category, note) are always accurate and structured;
-// only the surrounding tone varies.
-const PERFORMER_MESSAGE_VARIANTS = [
-  { opener: "🏆 What a match! Take a bow —", closer: (team) => `Absolutely brilliant from the whole ${team} squad today! 👏🏏` },
-  { opener: "🌟 Stars of the day —", closer: (team) => `This is what ${team} cricket looks like. Well played! 🎊` },
-  { opener: "🎽 Today belonged to —", closer: (team) => `Congratulations from every single one of us at ${team}! 👏` },
-  { opener: "🎉 Round of applause, please —", closer: (team) => `Proud of you all — ${team} at its best! 🙌🏏` },
-  { opener: "🏏 Hats off to today's standout performers —", closer: (team) => `Cheers to more days like this, ${team}! 🍻🏏` },
-  { opener: "💪 Legends in the making —", closer: (team) => `Great work out there, ${team}! 🏆` },
-];
+// "Proud captain" tone, picked from a set of drafted options — fixed
+// copy now rather than the randomized opener/closer pool this used to
+// pull from, so the message reads the same deliberate way every time
+// instead of a different random variant each share.
 function buildMatchPerformersMessage(match, players, teamName) {
   const perf = match.performers || {};
   const filled = PERFORMER_CATEGORIES
@@ -1544,11 +1727,8 @@ function buildMatchPerformersMessage(match, players, teamName) {
     .filter((c) => c.entry && c.entry.playerId);
   if (filled.length === 0) return "";
   const team = teamName || "the team";
-  const variant = PERFORMER_MESSAGE_VARIANTS[Math.floor(Math.random() * PERFORMER_MESSAGE_VARIANTS.length)];
   const out = [];
-  out.push(`🏆 *Match Performers — ${cleanField(match.groundName, "Match")}*`);
-  out.push("");
-  out.push(variant.opener);
+  out.push(`🏏 *Today was a team effort, ${team}* 🏏`);
   out.push("");
   filled.forEach((c) => {
     const p = players.find((pl) => pl.id === c.entry.playerId);
@@ -1557,7 +1737,27 @@ function buildMatchPerformersMessage(match, players, teamName) {
     if (c.entry.note && c.entry.note.trim()) out.push(`   ${c.entry.note.trim()}`);
     out.push("");
   });
-  out.push(variant.closer(team));
+  out.push("Congratulations to today's standout performers — and to every single player who backed them up, fielded their heart out, and cheered from the sidelines. A win belongs to the whole squad, not just the scoreboard.");
+  out.push("");
+  out.push("Immensely proud to be part of this team. See you all at the next one! 🙌");
+  return out.join("\n");
+}
+// A separate button an admin/player taps deliberately after a loss — the
+// app has no match-result field (runs/wickets aren't tracked anywhere),
+// so this can't fire itself off the way a "you won" message could;
+// someone has to choose to send it. Deliberately doesn't reference
+// performers at all, since naming a "best performer" after a loss isn't
+// really the point of this message.
+function buildTeamEncouragementMessage(teamName) {
+  const team = teamName || "the team";
+  const out = [];
+  out.push(`🏏 *Tough one today, ${team}.*`);
+  out.push("");
+  out.push("Not the result we wanted, but that's cricket — some days the game doesn't go our way, and that's okay.");
+  out.push("");
+  out.push("Thank you to everyone who turned up, fought till the last ball, and gave it their all today. That effort doesn't go unnoticed.");
+  out.push("");
+  out.push("Heads up, chins up. We regroup, train hard, and come back stronger. Next match, we go again! 💪🏏");
   return out.join("\n");
 }
 // Carpooling: a flat map on the match, keyed by player id, same shape as
@@ -1991,6 +2191,35 @@ async function hashPin(pin) {
   const buf = await crypto.subtle.digest("SHA-256", enc);
   return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+// Client-side-only speed bump against repeated wrong-PIN guessing through
+// the UI itself — not a real security boundary (a page reload clears it,
+// and reading Firestore directly bypasses the UI entirely; see
+// SECURITY.md's notes on why that's an accepted trade-off). This just makes
+// "keep tapping Continue" slower in the moment, on every PIN-entry screen.
+const PIN_LOCKOUT_THRESHOLD = 5;
+const PIN_LOCKOUT_SECONDS = 30;
+function usePinLockout() {
+  const [attempts, setAttempts] = useState(0);
+  const [lockedUntil, setLockedUntil] = useState(null);
+  const [now, setNow] = useState(Date.now());
+  useEffect(() => {
+    if (!lockedUntil) return;
+    const t = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [lockedUntil]);
+  const remaining = lockedUntil ? Math.max(0, Math.ceil((lockedUntil - now) / 1000)) : 0;
+  useEffect(() => {
+    if (lockedUntil && remaining === 0) { setLockedUntil(null); setAttempts(0); }
+  }, [remaining, lockedUntil]);
+  function registerFailedAttempt() {
+    const next = attempts + 1;
+    setAttempts(next);
+    if (next >= PIN_LOCKOUT_THRESHOLD) setLockedUntil(Date.now() + PIN_LOCKOUT_SECONDS * 1000);
+  }
+  function reset() { setAttempts(0); setLockedUntil(null); }
+  return { isLocked: remaining > 0, remaining, registerFailedAttempt, reset };
+}
 const AVATAR_COLORS = ["#C08A45", "#7C2A28", "#3B6D11", "#185FA5", "#8A5FC0", "#B0552E", "#2F7A6E"];
 function avatarColor(name) {
   let sum = 0;
@@ -2412,7 +2641,7 @@ function PlayerAvatarUpload({ player, photo, onUpload, onView }) {
       <PlayerAvatar name={player.name} photo={photo} size={38} border={false} onView={photo ? () => onView(player.name, photo) : undefined} />
       <button
         onClick={() => inputRef.current && inputRef.current.click()}
-        title="Change photo"
+        title="Change photo" aria-label="Change photo"
         style={{
           position: "absolute", bottom: -2, right: -2, width: 16, height: 16, borderRadius: "50%",
           background: COLORS.willow, border: "2px solid #16301F", display: "flex", alignItems: "center",
@@ -2473,7 +2702,7 @@ function TeamLogoUpload({ teamName, logo, size = 40, onUpload, onView, editable 
         <>
           <button
             onClick={() => inputRef.current && inputRef.current.click()}
-            title="Change team logo"
+            title="Change team logo" aria-label="Change team logo"
             style={{
               position: "absolute", bottom: -2, right: -2, width: 16, height: 16, borderRadius: "50%",
               background: COLORS.willow, border: "2px solid #16301F", display: "flex", alignItems: "center",
@@ -2637,7 +2866,7 @@ function AvatarStack({ people, max = 5, currentPlayerId, photos, onViewPhoto, on
                 {onViewClip && p.battingVideoUrl && (
                   <button
                     onClick={() => onViewClip(p, "Batting")}
-                    title="View batting clip"
+                    title="View batting clip" aria-label="View batting clip"
                     style={{
                       width: 16, height: 16, borderRadius: "50%", background: COLORS.willow, color: "#fff", border: "none",
                       display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, cursor: "pointer", padding: 0, flexShrink: 0,
@@ -2649,7 +2878,7 @@ function AvatarStack({ people, max = 5, currentPlayerId, photos, onViewPhoto, on
                 {onViewClip && p.bowlingVideoUrl && (
                   <button
                     onClick={() => onViewClip(p, "Bowling")}
-                    title="View bowling clip"
+                    title="View bowling clip" aria-label="View bowling clip"
                     style={{
                       width: 16, height: 16, borderRadius: "50%", background: COLORS.leather, color: "#fff", border: "none",
                       display: "flex", alignItems: "center", justifyContent: "center", fontSize: 8, cursor: "pointer", padding: 0, flexShrink: 0,
@@ -2695,6 +2924,19 @@ function nextWeekday(iso) {
     d.setDate(d.getDate() + 1);
   }
   return toISO(d);
+}
+// The single rule for "which day is next nets" on the player side — shared
+// by the Attendance tab's starting day and the Home dashboard's "Next
+// nets" card so they can never disagree. Before 7 AM, today's session is
+// still ahead (it's always wrapped up by 7 AM), so today is still the
+// relevant day; from 7 AM on, today's session is done, so it points at the
+// next upcoming one instead. Resolved once at login (a lazy useState
+// initializer, not recomputed on every render) — deliberately a snapshot
+// of what time it was when the player signed in, not a live clock, so it
+// can't flip out from under them mid-session.
+function nextNetsIsoForLogin() {
+  const hour = new Date().getHours();
+  return hour < 7 ? nextWeekday(todayISO()) : nextWeekday(tomorrowISO());
 }
 const SESSION_KEY = "cricket_nets_session";
 const SESSION_DURATION_MS = 15 * 60 * 1000; // stay logged in for 15 minutes, then require PIN again
@@ -2950,7 +3192,14 @@ function computeMonthTotals(monthKeyStr, subs, days, payments, rates) {
   const expected = subPlayers.length * rates.subAmount;
   const collected = subPlayers.reduce((sum, pid) => sum + (Number(monthPayments[pid]) || 0), 0);
   const pending = expected - collected;
-  const balance = collected - expense;
+  // Accrual-basis, not cash-basis: measured against what the full roster
+  // owes for the month (expected), not just what's physically been
+  // collected so far — a subscription still pending isn't money that's
+  // gone, just money that hasn't landed yet. This is what carries forward
+  // month to month (runningCarryFor) and drives the on-screen/WhatsApp
+  // Shortfall figure, so it stays one consistent number everywhere rather
+  // than one place saying "short" while another says "fine".
+  const balance = expected - expense;
   return { hours, balls, netFee, ballFee, expense, expected, collected, pending, balance, subscribedCount: subPlayers.length, dayEntries };
 }
 
@@ -3005,6 +3254,39 @@ function buildFullSeasonCSV(subs, days, payments, rates, adjustments, lockedMont
   return lines.join("\n");
 }
 
+// Wraps a CSV cell in quotes (doubling any inner quote) only when it
+// actually needs it — commas or quotes in a free-typed name/ground would
+// otherwise silently corrupt the column count. The season-finance CSV
+// above never needed this (every cell there is a number or a fixed
+// month label); roster and match names are free text, so this export
+// needs to be careful where that one wasn't.
+function csvCell(value) {
+  const s = String(value ?? "");
+  return /[",\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+}
+
+function buildRosterCSV(players, pins) {
+  const lines = [["Name", "HasPin", "Guest", "DateOfBirth"].join(",")];
+  players.forEach((p) => {
+    lines.push([csvCell(p.name), pins[p.id] ? "Yes" : "No", p.guest ? "Yes" : "No", p.dob || ""].join(","));
+  });
+  return lines.join("\n");
+}
+
+function buildMatchHistoryCSV(matches, players) {
+  const lines = [["Date", "Ground", "MatchType", "Time", "Capacity", "Available", "PlayedCount", "TotalCost", "PaidCount"].join(",")];
+  const matchList = Object.values(matches || {}).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  matchList.forEach((m) => {
+    const playedIds = computePlayedIds(m);
+    const paidCount = playedIds.filter((id) => (m.payments || {})[id]).length;
+    lines.push([
+      m.date || "", csvCell(m.groundName || ""), csvCell(m.matchType || ""), m.time || "",
+      m.capacity || "", (m.available || []).length, playedIds.length, m.totalCost || "0", paidCount,
+    ].join(","));
+  });
+  return lines.join("\n");
+}
+
 function computeAttendanceStats(players, days) {
   const sessionDates = Object.keys(days).sort();
   const total = sessionDates.length;
@@ -3018,6 +3300,22 @@ function computeAttendanceStats(players, days) {
 }
 
 function CricketNetsTracker() {
+  // Purely a UI signal — window.storage's own retry/reconnect logic
+  // (see the shim below) is what actually handles a dropped connection;
+  // this just tells the person using the app that writes aren't going
+  // through right now, instead of failing silently.
+  const [isOnline, setIsOnline] = useState(() => (typeof navigator === "undefined" ? true : navigator.onLine));
+  useEffect(() => {
+    function goOnline() { setIsOnline(true); }
+    function goOffline() { setIsOnline(false); }
+    window.addEventListener("online", goOnline);
+    window.addEventListener("offline", goOffline);
+    return () => {
+      window.removeEventListener("online", goOnline);
+      window.removeEventListener("offline", goOffline);
+    };
+  }, []);
+
   // ---- Team context (multi-team platform) ----
   // Every existing piece of data below (players, matches, etc.) is
   // automatically scoped to whichever team is active, transparently, by
@@ -3094,6 +3392,11 @@ function CricketNetsTracker() {
   const [playerPinResetRequests, setPlayerPinResetRequests] = useState({});
   const [matches, setMatches] = useState({});
   const [paymentDefault, setPaymentDefault] = useState({ upiNumber: "", qr: null });
+  // Separate from paymentDefault (matches) — starts empty and, wherever
+  // it's actually used, silently falls back to paymentDefault until an
+  // admin sets one. Same "override, don't duplicate" shape a per-match QR
+  // already uses against this same team default, one level up.
+  const [subscriptionPaymentDefault, setSubscriptionPaymentDefault] = useState({ upiNumber: "", qr: null });
   // fcmTokens is an array, not a single value — the admin PIN is shared
   // team-wide, so more than one device can legitimately be "the admin" at
   // once, and all of them should get admin notifications, not just
@@ -3104,6 +3407,12 @@ function CricketNetsTracker() {
   const [marketplace, setMarketplace] = useState({});
   const [photos, setPhotos] = useState({});
   const [saveError, setSaveError] = useState("");
+  // Ordered list of photo ids for the rotating team-photo banner on each
+  // player's Home tab — just the ids; each photo's actual image data
+  // lives in its own photo_ document (see teamPhotoKey below), same
+  // "small list, separate image docs" split every other multi-photo
+  // feature here uses (match banners, Gear Exchange listings).
+  const [teamPhotoIds, setTeamPhotoIds] = useState([]);
 
   const [mode, setMode] = useState(() => readSession().mode || "select"); // select | admin-login | admin | player
   const [authedAdmin, setAuthedAdmin] = useState(() => !!readSession().authedAdmin);
@@ -3232,7 +3541,7 @@ function CricketNetsTracker() {
     }
     window.__activeTeam = activeTeam; // must be set before any storage call below
 
-    const DATA_KEYS = ["players", "subs", "days", "pins", "payments", "adminPin", "rates", "adjustments", "lockedMonths", "weekendExceptions", "pendingRegistrations", "matches", "paymentDefault", "playerPinResetRequests", "adminNotify", "marketplace"];
+    const DATA_KEYS = ["players", "subs", "days", "pins", "payments", "adminPin", "rates", "adjustments", "lockedMonths", "weekendExceptions", "pendingRegistrations", "matches", "paymentDefault", "subscriptionPaymentDefault", "playerPinResetRequests", "adminNotify", "marketplace", "teamPhotoIds"];
     const lastRaw = {};
 
     // Reset to a clean slate so a previous team's data never flashes
@@ -3240,8 +3549,8 @@ function CricketNetsTracker() {
     setPlayers([]); setSubs({}); setDays({}); setPins({}); setPayments({});
     setAdminPin(null); setRates(DEFAULT_RATES); setAdjustments({}); setLockedMonths({});
     setWeekendExceptions({}); setPendingRegistrations({}); setMatches({}); setPhotos({});
-    setPaymentDefault({ upiNumber: "", qr: null }); setPlayerPinResetRequests({});
-    setAdminNotify({ fcmTokens: [] }); setMarketplace({});
+    setPaymentDefault({ upiNumber: "", qr: null }); setSubscriptionPaymentDefault({ upiNumber: "", qr: null }); setPlayerPinResetRequests({});
+    setAdminNotify({ fcmTokens: [] }); setMarketplace({}); setTeamPhotoIds([]);
 
     function applyValue(key, raw) {
       if (raw === undefined || raw === null) return;
@@ -3262,9 +3571,11 @@ function CricketNetsTracker() {
         else if (key === "pendingRegistrations") setPendingRegistrations(parsed);
         else if (key === "matches") setMatches(parsed);
         else if (key === "paymentDefault") setPaymentDefault({ upiNumber: "", qr: null, ...parsed });
+        else if (key === "subscriptionPaymentDefault") setSubscriptionPaymentDefault({ upiNumber: "", qr: null, ...parsed });
         else if (key === "playerPinResetRequests") setPlayerPinResetRequests(parsed);
         else if (key === "adminNotify") setAdminNotify({ fcmTokens: [], ...parsed });
         else if (key === "marketplace") setMarketplace(parsed);
+        else if (key === "teamPhotoIds") setTeamPhotoIds(parsed);
       } catch (e) {
         console.error("Failed to parse", key, e);
       }
@@ -3542,9 +3853,11 @@ function CricketNetsTracker() {
   useEffect(() => { if (ready) persist("pendingRegistrations", pendingRegistrations); }, [pendingRegistrations, ready, persist]);
   useEffect(() => { if (ready) persist("matches", matches); }, [matches, ready, persist]);
   useEffect(() => { if (ready) persist("paymentDefault", paymentDefault); }, [paymentDefault, ready, persist]);
+  useEffect(() => { if (ready) persist("subscriptionPaymentDefault", subscriptionPaymentDefault); }, [subscriptionPaymentDefault, ready, persist]);
   useEffect(() => { if (ready) persist("playerPinResetRequests", playerPinResetRequests); }, [playerPinResetRequests, ready, persist]);
   useEffect(() => { if (ready) persist("adminNotify", adminNotify); }, [adminNotify, ready, persist]);
   useEffect(() => { if (ready) persist("marketplace", marketplace); }, [marketplace, ready, persist]);
+  useEffect(() => { if (ready) persist("teamPhotoIds", teamPhotoIds); }, [teamPhotoIds, ready, persist]);
 
   const monthSubPlayers = subs[activeMonth] || [];
   const monthPayments = payments[activeMonth] || {};
@@ -3957,12 +4270,17 @@ function CricketNetsTracker() {
     const field = playerVideoField(slotType);
     setPlayers((prev) => prev.map((p) => (p.id === playerId ? { ...p, [field]: null } : p)));
   }
-  function toggleSub(pid) {
-    if (lockedMonths[activeMonth]) return;
+  // month defaults to activeMonth (every existing call site keeps working
+  // unchanged) — the optional second argument only exists so the player
+  // Subscription tab's forward-month browsing can toggle a future month
+  // without needing the shared activeMonth to actually change.
+  function toggleSub(pid, month) {
+    const targetMonth = month || activeMonth;
+    if (lockedMonths[targetMonth]) return;
     setSubs((prev) => {
-      const cur = new Set(prev[activeMonth] || []);
+      const cur = new Set(prev[targetMonth] || []);
       cur.has(pid) ? cur.delete(pid) : cur.add(pid);
-      return { ...prev, [activeMonth]: Array.from(cur) };
+      return { ...prev, [targetMonth]: Array.from(cur) };
     });
   }
   function togglePaid(pid) {
@@ -4025,6 +4343,9 @@ function CricketNetsTracker() {
   }
   function setPaymentDefaultField(field, value) {
     setPaymentDefault((prev) => ({ ...prev, [field]: value }));
+  }
+  function setSubscriptionPaymentDefaultField(field, value) {
+    setSubscriptionPaymentDefault((prev) => ({ ...prev, [field]: value }));
   }
   function toggleMonthLock() {
     setLockedMonths((prev) => {
@@ -4427,6 +4748,38 @@ function CricketNetsTracker() {
       return true;
     } catch (e) {
       console.error("Failed to remove match banner", e);
+      return false;
+    }
+  }
+  // Same hybrid pattern as a match banner above: the image goes in its own
+  // document, and only its id gets added to teamPhotoIds (the small
+  // ordered list). Returns false (without touching state) once the cap's
+  // already reached, so the Settings UI's "+" tile can just stop rendering
+  // rather than needing its own separate count check.
+  async function addTeamPhoto(dataUrl) {
+    if (teamPhotoIds.length >= TEAM_PHOTOS_MAX) return false;
+    try {
+      const id = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const key = teamPhotoKey(id);
+      const res = await window.storage.set(`photo_${key}`, dataUrl);
+      if (!res) return false;
+      setPhotos((prev) => ({ ...prev, [key]: dataUrl }));
+      setTeamPhotoIds((prev) => [...prev, id]);
+      return true;
+    } catch (e) {
+      console.error("Failed to upload team photo", e);
+      return false;
+    }
+  }
+  async function removeTeamPhoto(id) {
+    try {
+      const key = teamPhotoKey(id);
+      await window.storage.set(`photo_${key}`, "");
+      setPhotos((prev) => { const next = { ...prev }; delete next[key]; return next; });
+      setTeamPhotoIds((prev) => prev.filter((pid) => pid !== id));
+      return true;
+    } catch (e) {
+      console.error("Failed to remove team photo", e);
       return false;
     }
   }
@@ -4932,6 +5285,44 @@ function CricketNetsTracker() {
     setMatches((prev) => { const next = { ...prev }; delete next[matchId]; return next; });
   }
 
+  // Moves matches older than MATCH_ARCHIVE_RETENTION_DAYS out of the live
+  // `matches` document into per-year archive documents (matchesArchive_YYYY).
+  // Nothing is deleted — it's the same data, just filed under a different
+  // key — so the live `matches` blob (rewritten in full on every match edit)
+  // stays small, while old matches remain readable via the Completed tab's
+  // date-range search. Admin-triggered only, never automatic.
+  async function archiveOldMatches() {
+    const cutoff = isoDateDaysAgo(MATCH_ARCHIVE_RETENTION_DAYS);
+    // A match that still has unpaid players stays live — archived matches are
+    // read-only, so filing one away would strand its dues where they can
+    // neither be marked paid nor show up in the Match dues card.
+    const knownIds = new Set(players.map((p) => p.id));
+    const toArchive = Object.values(matches).filter((m) => m.date && m.date < cutoff && matchUnpaidIds(m, knownIds).length === 0);
+    if (toArchive.length === 0) return { archived: 0, years: [] };
+    const byYear = {};
+    toArchive.forEach((m) => {
+      const year = m.date.slice(0, 4);
+      (byYear[year] = byYear[year] || []).push(m);
+    });
+    for (const [year, list] of Object.entries(byYear)) {
+      let existing = {};
+      try {
+        const res = await window.storage.get(`matchesArchive_${year}`);
+        if (res && res.value) existing = JSON.parse(res.value);
+      } catch (e) {
+        console.error("archiveOldMatches: failed to read archive", year, e);
+      }
+      list.forEach((m) => { existing[m.id] = m; });
+      await window.storage.set(`matchesArchive_${year}`, JSON.stringify(existing));
+    }
+    setMatches((prev) => {
+      const next = { ...prev };
+      toArchive.forEach((m) => delete next[m.id]);
+      return next;
+    });
+    return { archived: toArchive.length, years: Object.keys(byYear) };
+  }
+
   // posterId is null when the admin posts on the team's own behalf (e.g.
   // selling old club kit) — there's no player record to attribute it to.
   // fields.photos is an array of up to 4 data URLs — same shape whether
@@ -5240,6 +5631,7 @@ function CricketNetsTracker() {
           switchTeam={switchTeam}
           teamRecord={teamRecord}
           paymentDefault={paymentDefault}
+          subscriptionPaymentDefault={subscriptionPaymentDefault}
           uploadMatchProof={uploadMatchProof}
           removeMatchProof={removeMatchProof}
           setPlayerVideo={setPlayerVideo}
@@ -5260,6 +5652,7 @@ function CricketNetsTracker() {
           onMatchLiveStopped={stopMatchLive}
           onNetsLiveStarted={startNetsLive}
           onNetsLiveStopped={stopNetsLive}
+          teamPhotoIds={teamPhotoIds}
         />
       )}
 
@@ -5270,13 +5663,22 @@ function CricketNetsTracker() {
           <div className="admin-main-col" style={{ flex: 1, minWidth: 0 }}>
           <div style={{ background: COLORS.pitch, color: COLORS.cream, padding: "20px 20px 0" }}>
             <div className="w-760" style={{ margin: "0 auto" }}>
-              <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
-                <button onClick={() => { setAuthedAdmin(false); setMode("select"); }} style={{ ...iconBtnStyle, background: COLORS.pitchLight, borderRadius: 8, padding: "6px 10px", display: "flex", alignItems: "center", gap: 6 }}>
-                  <Icon size={14}>←</Icon> <span style={{ fontSize: 12 }}>Exit</span>
-                </button>
-                <button onClick={switchTeam} style={{ ...iconBtnStyle, background: COLORS.pitchLight, borderRadius: 8, padding: "6px 10px", display: "flex", alignItems: "center", gap: 6 }}>
-                  <Icon size={14}>⇄</Icon> <span style={{ fontSize: 12 }}>Switch team</span>
-                </button>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 6, marginBottom: 14 }}>
+                <div style={{ display: "flex", gap: 6 }}>
+                  <button onClick={() => { setAuthedAdmin(false); setMode("select"); }} style={{ ...iconBtnStyle, background: COLORS.pitchLight, borderRadius: 8, padding: "6px 10px", display: "flex", alignItems: "center", gap: 6 }}>
+                    <Icon size={14}>←</Icon> <span style={{ fontSize: 12 }}>Exit</span>
+                  </button>
+                  <button onClick={switchTeam} style={{ ...iconBtnStyle, background: COLORS.pitchLight, borderRadius: 8, padding: "6px 10px", display: "flex", alignItems: "center", gap: 6 }}>
+                    <Icon size={14}>⇄</Icon> <span style={{ fontSize: 12 }}>Switch team</span>
+                  </button>
+                </div>
+                <NotificationBell
+                  enabled={!!(myAdminPushToken() && (adminNotify.fcmTokens || []).includes(myAdminPushToken()))}
+                  busy={adminPushBusy}
+                  error={!!adminPushError}
+                  onToggle={handleToggleAdminPush}
+                  title="Notifications — new registrations and PIN reset requests"
+                />
               </div>
               <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 10, textAlign: "left" }}>
                 {teamRecord && (
@@ -5326,28 +5728,7 @@ function CricketNetsTracker() {
 
           <div className="w-760" style={{ margin: "0 auto", padding: "20px", paddingBottom: 96 }}>
             <BirthdayBanner players={players} teamName={teamRecord ? teamRecord.teamName : ""} />
-            <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 14 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-                <div>
-                  <div style={{ fontSize: 12.5, fontWeight: 600 }}>🔔 Notifications</div>
-                  <div style={{ fontSize: 10.5, color: COLORS.inkSoft, marginTop: 2 }}>New registrations and PIN reset requests</div>
-                </div>
-                <button
-                  onClick={handleToggleAdminPush}
-                  disabled={adminPushBusy}
-                  style={{
-                    flexShrink: 0, fontSize: 11.5, fontWeight: 700, borderRadius: 8, padding: "7px 12px", cursor: adminPushBusy ? "default" : "pointer",
-                    background: myAdminPushToken() && (adminNotify.fcmTokens || []).includes(myAdminPushToken()) ? "#3B7A3E" : "transparent",
-                    color: myAdminPushToken() && (adminNotify.fcmTokens || []).includes(myAdminPushToken()) ? "#fff" : COLORS.willow,
-                    border: `1px solid ${myAdminPushToken() && (adminNotify.fcmTokens || []).includes(myAdminPushToken()) ? "#3B7A3E" : COLORS.willow}`,
-                    opacity: adminPushBusy ? 0.7 : 1,
-                  }}
-                >
-                  {adminPushBusy ? "…" : myAdminPushToken() && (adminNotify.fcmTokens || []).includes(myAdminPushToken()) ? "On — tap to turn off" : "Turn on"}
-                </button>
-              </div>
-              {adminPushError && <div style={{ fontSize: 11, color: COLORS.leather, marginTop: 8 }}>{adminPushError}</div>}
-            </div>
+            {adminPushError && <div style={{ background: "#FCEBEA", color: COLORS.leather, padding: "8px 12px", borderRadius: 8, fontSize: 13, marginBottom: 14 }}>{adminPushError}</div>}
             <LiveNowBanner
               items={computeLiveItems(matches, days)}
               onJump={(item) => {
@@ -5371,6 +5752,7 @@ function CricketNetsTracker() {
                 selectedDate={selectedDate}
                 setSelectedDate={setSelectedDate}
                 players={players}
+                subs={subs}
                 dayData={dayData}
                 toggleVote={(pid) => toggleVoteFor(selectedDate, pid)}
                 setDayField={setDayField}
@@ -5388,7 +5770,7 @@ function CricketNetsTracker() {
               />
             )}
             {tab === "sub" && (
-              <SubscriptionTab players={players} monthSubPlayers={monthSubPlayers} toggleSub={toggleSub} activeMonth={activeMonth} totals={totals} monthPayments={monthPayments} togglePaid={togglePaid} rates={activeMonthRates} isLocked={isMonthLocked} photos={photos} onViewPhoto={openTopLevelPhoto} notifySubReminderNudge={notifySubReminderNudge} />
+              <SubscriptionTab players={players} monthSubPlayers={monthSubPlayers} toggleSub={toggleSub} activeMonth={activeMonth} totals={totals} monthPayments={monthPayments} togglePaid={togglePaid} rates={activeMonthRates} isLocked={isMonthLocked} photos={photos} onViewPhoto={openTopLevelPhoto} notifySubReminderNudge={notifySubReminderNudge} paymentDefault={paymentDefault} subscriptionPaymentDefault={subscriptionPaymentDefault} teamName={teamRecord ? teamRecord.teamName : ""} />
             )}
             {tab === "players" && (
               <PlayersTab players={players} newPlayerName={newPlayerName} setNewPlayerName={setNewPlayerName} addPlayer={addPlayer} removePlayer={removePlayer} pins={pins} resetPlayerPin={resetPlayerPin} playerError={playerError} setPlayerError={setPlayerError} pendingRegistrations={pendingRegistrations} approveRegistration={approveRegistration} rejectRegistration={rejectRegistration} photos={photos} removePlayerVideo={removePlayerVideo} teamCode={activeTeam} playerPinResetRequests={playerPinResetRequests} dismissPlayerPinResetRequest={dismissPlayerPinResetRequest} updatePlayerDob={updatePlayerDob} makeFullMember={makeFullMember} />
@@ -5401,13 +5783,14 @@ function CricketNetsTracker() {
                 monthAdjustment={monthAdjustment} monthAdjustmentRaw={monthAdjustmentRaw} setAdjustmentValue={setAdjustmentValue}
                 perPlayerExtra={perPlayerExtra} onExportFullSeason={handleExportFullSeason}
                 isLocked={isMonthLocked} toggleMonthLock={toggleMonthLock}
+                paymentDefault={paymentDefault} subscriptionPaymentDefault={subscriptionPaymentDefault}
               />
             )}
             {tab === "stats" && (
-              <StatsTab players={players} days={days} photos={photos} onViewPhoto={openTopLevelPhoto} />
+              <StatsTab players={players} days={days} subs={subs} photos={photos} onViewPhoto={openTopLevelPhoto} />
             )}
             {tab === "settings" && (
-              <SettingsTab rates={rates} setRateField={setRateField} paymentDefault={paymentDefault} setPaymentDefaultField={setPaymentDefaultField} />
+              <SettingsTab rates={rates} setRateField={setRateField} paymentDefault={paymentDefault} setPaymentDefaultField={setPaymentDefaultField} subscriptionPaymentDefault={subscriptionPaymentDefault} setSubscriptionPaymentDefaultField={setSubscriptionPaymentDefaultField} adminPin={adminPin} setAdminPin={setAdminPin} teamPhotoIds={teamPhotoIds} photos={photos} addTeamPhoto={addTeamPhoto} removeTeamPhoto={removeTeamPhoto} />
             )}
             {tab === "matches" && (
               <MatchesAdminTab
@@ -5423,6 +5806,7 @@ function CricketNetsTracker() {
                 setMatchPerformerField={setMatchPerformerField} clearMatchPerformer={clearMatchPerformer}
                 onMatchLiveStarted={startMatchLive} onMatchLiveStopped={stopMatchLive}
                 teamName={teamRecord ? teamRecord.teamName : ""}
+                archiveOldMatches={archiveOldMatches}
               />
             )}
             {tab === "gear" && (
@@ -5452,6 +5836,20 @@ function CricketNetsTracker() {
       {topLevelViewingPhoto && (
         <PhotoViewerModal name={topLevelViewingPhoto.name} photo={topLevelViewingPhoto.photo} onClose={() => setTopLevelViewingPhoto(null)} />
       )}
+      <OfflineBanner online={isOnline} />
+    </div>
+  );
+}
+
+function OfflineBanner({ online }) {
+  if (online) return null;
+  return (
+    <div style={{
+      position: "fixed", left: 0, right: 0, top: 0, zIndex: 200,
+      background: COLORS.leather, color: "#fff", fontSize: 12.5, fontWeight: 600,
+      padding: "8px 14px", textAlign: "center", display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+    }}>
+      <Icon size={13}>📡</Icon> You're offline — changes won't save until you're back online
     </div>
   );
 }
@@ -5582,7 +5980,7 @@ function PlainStatCard({ value, label, accent }) {
 // this just doesn't duplicate it.
 function AdminHomeDashboard({ matches, days, players, pendingRegistrations, playerPinResetRequests, subs, payments, activeMonth, rates, marketplace, setTab, setSelectedDate, notifyPendingVotesNudge, notifySubReminderNudge }) {
   const today = todayISO();
-  const upcomingMatches = Object.values(matches || {}).filter((m) => m.date && m.date >= today).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const upcomingMatches = Object.values(matches || {}).filter((m) => m.date && m.date >= today && m.status !== "cancelled").sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   const nextMatch = upcomingMatches[0] || null;
   const nextMatchNotResponded = nextMatch
     ? players.filter((p) => !(nextMatch.available || []).includes(p.id) && !(nextMatch.notAvailable || []).includes(p.id) && !(nextMatch.waitlist || []).includes(p.id))
@@ -5948,6 +6346,7 @@ function RequestTeamView({ onBack, requestNewTeam, suggestTeamCode, teamCodeTake
             className="pinbox" type="password" inputMode="numeric" maxLength={4} value={pin}
             onChange={(e) => setPin(e.target.value.replace(/\D/g, "").slice(0, 4))}
             placeholder="••••"
+            aria-label="Set your admin PIN"
             style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: 10 }}
           />
           <input
@@ -5955,6 +6354,7 @@ function RequestTeamView({ onBack, requestNewTeam, suggestTeamCode, teamCodeTake
             onChange={(e) => setPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 4))}
             onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
             placeholder="Confirm PIN"
+            aria-label="Confirm admin PIN"
             style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: 14 }}
           />
 
@@ -6031,15 +6431,18 @@ function SuperAdminFlow({
   const [error, setError] = useState("");
   const [subTab, setSubTab] = useState("requests");
   const [busyCode, setBusyCode] = useState(null);
+  const pinLockout = usePinLockout();
 
   if (!authedSuperAdmin) {
     const hasPin = !!superAdminPin;
     async function handleContinue() {
       setError("");
+      if (pinLockout.isLocked) { setError(`Too many attempts — try again in ${pinLockout.remaining}s.`); return; }
       if (hasPin) {
         if (pinInput.length !== 4) { setError("Enter your PIN."); return; }
         const hashed = await hashPin(pinInput);
-        if (hashed !== superAdminPin) { setError("That PIN doesn't match."); return; }
+        if (hashed !== superAdminPin) { pinLockout.registerFailedAttempt(); setError("That PIN doesn't match."); return; }
+        pinLockout.reset();
         setAuthedSuperAdmin(true);
         setView("super-admin");
       } else {
@@ -6063,6 +6466,7 @@ function SuperAdminFlow({
               className="pinbox" type="password" inputMode="numeric" maxLength={4} value={pinInput}
               onChange={(e) => setPinInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
               placeholder="••••"
+              aria-label={hasPin ? "Enter Super Admin PIN" : "Set Super Admin PIN"}
               style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: hasPin ? 12 : 8 }}
             />
             {!hasPin && (
@@ -6071,12 +6475,16 @@ function SuperAdminFlow({
                 onChange={(e) => setPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 4))}
                 onKeyDown={(e) => e.key === "Enter" && handleContinue()}
                 placeholder="Confirm PIN"
+                aria-label="Confirm Super Admin PIN"
                 style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: 12 }}
               />
             )}
             {error && <div style={{ color: "#F0A6A4", fontSize: 12, marginBottom: 10 }}>{error}</div>}
-            <button onClick={handleContinue} style={{ width: "100%", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
-              Continue
+            <button
+              onClick={handleContinue} disabled={pinLockout.isLocked}
+              style={{ width: "100%", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 14, fontWeight: 600, cursor: pinLockout.isLocked ? "default" : "pointer", opacity: pinLockout.isLocked ? 0.6 : 1 }}
+            >
+              {pinLockout.isLocked ? `Try again in ${pinLockout.remaining}s` : "Continue"}
             </button>
           </div>
         </div>
@@ -6425,7 +6833,7 @@ function ModeSelect({ onAdmin, onPlayer, onRegister, sessionExpiredNotice, showI
 
       {showInstallBanner && (
         <div className="w-320" style={{ marginTop: 24, width: "100%", background: COLORS.pitchLight, borderRadius: 12, padding: 14, textAlign: "left", position: "relative" }}>
-          <button onClick={onDismissInstall} style={{ position: "absolute", top: 8, right: 10, background: "transparent", border: "none", color: "#7C8E80", cursor: "pointer", fontSize: 14 }}>✕</button>
+          <button onClick={onDismissInstall} aria-label="Dismiss" style={{ position: "absolute", top: 8, right: 10, background: "transparent", border: "none", color: "#7C8E80", cursor: "pointer", fontSize: 14 }}>✕</button>
           <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
             <div style={{ width: 36, height: 36, borderRadius: 10, background: COLORS.leather, display: "flex", alignItems: "center", justifyContent: "center", fontSize: 18, flexShrink: 0 }}>🏏</div>
             <div style={{ flex: 1 }}>
@@ -6463,13 +6871,16 @@ function AdminLogin({ adminPin, setAdminPin, onSuccess, onBack, teamCode, teamNa
   const [requestSent, setRequestSent] = useState(false);
   const [busy, setBusy] = useState(false);
   const hasPin = !!adminPin;
+  const pinLockout = usePinLockout();
 
   async function handleContinue() {
     setError("");
+    if (pinLockout.isLocked) { setError(`Too many attempts — try again in ${pinLockout.remaining}s.`); return; }
     if (hasPin) {
       if (pinInput.length !== 4) { setError("Enter your 4-digit admin PIN."); return; }
       const hashed = await hashPin(pinInput);
-      if (hashed !== adminPin) { setError("That PIN doesn't match. Try again."); return; }
+      if (hashed !== adminPin) { pinLockout.registerFailedAttempt(); setError("That PIN doesn't match. Try again."); return; }
+      pinLockout.reset();
       onSuccess();
     } else {
       if (pinInput.length !== 4) { setError("Choose a 4-digit PIN."); return; }
@@ -6511,6 +6922,7 @@ function AdminLogin({ adminPin, setAdminPin, onSuccess, onBack, teamCode, teamNa
               onChange={(e) => setPinInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
               onKeyDown={(e) => e.key === "Enter" && handleContinue()}
               placeholder="••••"
+              aria-label={hasPin ? "Enter admin PIN" : "Set an admin PIN"}
               style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: hasPin ? 12 : 8 }}
             />
             {!hasPin && (
@@ -6521,12 +6933,16 @@ function AdminLogin({ adminPin, setAdminPin, onSuccess, onBack, teamCode, teamNa
                 onChange={(e) => setPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 4))}
                 onKeyDown={(e) => e.key === "Enter" && handleContinue()}
                 placeholder="Confirm PIN"
+                aria-label="Confirm admin PIN"
                 style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: 12 }}
               />
             )}
             {error && <div style={{ color: "#F0A6A4", fontSize: 12, marginBottom: 10 }}>{error}</div>}
-            <button onClick={handleContinue} style={{ width: "100%", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
-              Continue
+            <button
+              onClick={handleContinue} disabled={pinLockout.isLocked}
+              style={{ width: "100%", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 14, fontWeight: 600, cursor: pinLockout.isLocked ? "default" : "pointer", opacity: pinLockout.isLocked ? 0.6 : 1 }}
+            >
+              {pinLockout.isLocked ? `Try again in ${pinLockout.remaining}s` : "Continue"}
             </button>
             {hasPin && (
               <button onClick={() => { setShowRequestForm(true); setError(""); setRequestSent(false); }} style={{ width: "100%", background: "transparent", border: "none", color: "#CFE0D3", fontSize: 12, marginTop: 12, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 5 }}>
@@ -6670,6 +7086,53 @@ function ClipSlot({ label, icon, url, onSave, onRemove, onView }) {
   );
 }
 
+// Rotating banner of team photos on each player's Home tab — crossfades
+// through teamPhotoIds every TEAM_PHOTO_INTERVAL_MS, with dot indicators.
+// Renders nothing at all once there are no photos yet, so a team that
+// hasn't uploaded any doesn't get an empty placeholder taking up space.
+function TeamPhotoCarousel({ photoIds, photos, onView }) {
+  const urls = (photoIds || []).map((id) => photos && photos[teamPhotoKey(id)]).filter(Boolean);
+  const [idx, setIdx] = useState(0);
+  useEffect(() => {
+    if (urls.length < 2) return;
+    const timer = setInterval(() => setIdx((i) => (i + 1) % urls.length), TEAM_PHOTO_INTERVAL_MS);
+    return () => clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [urls.length]);
+  if (urls.length === 0) return null;
+  // Clamped rather than trusted directly — if a photo got removed elsewhere
+  // while this was mounted, urls.length can shrink out from under a stale idx.
+  const safeIdx = idx % urls.length;
+  return (
+    // aspectRatio (matching the 16:9 the photos are actually cropped to at
+    // upload) instead of a fixed pixel height — a flat height didn't scale
+    // with the card's width, so on a wide desktop screen the banner's real
+    // on-screen shape ended up far wider-and-shorter than 16:9, and
+    // objectFit: cover had to zoom in hard to fill it, cropping the photo
+    // much tighter than intended (heads/edges cut off). Locking the ratio
+    // means cover never has to crop more than the upload crop already did,
+    // at any screen width.
+    <div style={{ position: "relative", borderRadius: 12, overflow: "hidden", aspectRatio: `${TEAM_PHOTO_CROP_W} / ${TEAM_PHOTO_CROP_H}`, background: COLORS.pitch }}>
+      {urls.map((url, i) => (
+        <img
+          key={i} src={url} alt="" onClick={onView ? () => onView(url) : undefined}
+          style={{
+            position: "absolute", inset: 0, width: "100%", height: "100%", objectFit: "cover",
+            opacity: i === safeIdx ? 1 : 0, transition: "opacity 900ms ease",
+            cursor: onView ? "pointer" : "default",
+          }}
+        />
+      ))}
+      {urls.length > 1 && (
+        <div style={{ position: "absolute", bottom: 8, left: 0, right: 0, display: "flex", justifyContent: "center", gap: 5 }}>
+          {urls.map((_, i) => (
+            <div key={i} style={{ width: 6, height: 6, borderRadius: "50%", background: i === safeIdx ? "#fff" : "rgba(255,255,255,0.45)" }} />
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
 function HighlightClipCard({ player, setPlayerVideo, removePlayerVideo, onView }) {
   return (
     <div>
@@ -6697,7 +7160,7 @@ function HighlightClipCard({ player, setPlayerVideo, removePlayerVideo, onView }
   );
 }
 
-function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, initialAuthView, activeTeam, pendingRegistrations, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, updateMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing, deleteMarketplaceListing, onMatchLiveStarted, onMatchLiveStopped, onNetsLiveStarted, onNetsLiveStopped }) {
+function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId, onBack, days, toggleVoteFor, toggleDeclineFor, subs, toggleSub, activeMonth, rates, totals, closingBalance, weekendExceptions, monthPayments, isMonthLocked, submitRegistration, photos, uploadOwnPhoto, matches, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, updatePlayerFcmToken, updatePendingRegistrationFcmToken, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, switchTeam, teamRecord, paymentDefault, subscriptionPaymentDefault, uploadMatchProof, removeMatchProof, setPlayerVideo, removePlayerVideo, initialSelectedId, initialAuthView, activeTeam, pendingRegistrations, rememberProfile, submitPlayerPinResetRequest, marketplace, postMarketplaceListing, updateMarketplaceListing, toggleMarketplaceInterest, closeMarketplaceListing, deleteMarketplaceListing, onMatchLiveStarted, onMatchLiveStopped, onNetsLiveStarted, onNetsLiveStopped, teamPhotoIds }) {
   const [selectedId, setSelectedId] = useState(() => (
     initialSelectedId && players.some((p) => p.id === initialSelectedId) ? initialSelectedId : ""
   ));
@@ -6705,6 +7168,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
   const [pinInput, setPinInput] = useState("");
   const [pinConfirm, setPinConfirm] = useState("");
   const [error, setError] = useState("");
+  const pinLockout = usePinLockout();
   // login: roster/search + PIN · register / registered: sign-up flow ·
   // forgot: PIN-reset request · waiting: recognized pending registration
   // (see the effect below). ModeSelect already asked "sign in or
@@ -6782,7 +7246,20 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
     else setRegPushError(res.error);
   }
   const [playerTab, setPlayerTab] = useState("home");
-  const [selectedDate, setSelectedDate] = useState(() => nextWeekday(tomorrowISO()));
+  // How many months forward from activeMonth the Subscription tab is
+  // currently looking at — an offset rather than a month string, so
+  // "cap at December" is a plain integer comparison instead of doing
+  // year-rollover arithmetic in both directions. Local to this component
+  // (not the shared activeMonth) so browsing ahead here never affects
+  // what an admin session elsewhere is looking at.
+  const [subMonthOffset, setSubMonthOffset] = useState(0);
+  const [selectedDate, setSelectedDate] = useState(nextNetsIsoForLogin);
+  // Same value, captured once at the same login moment — handed to the
+  // Home dashboard's "Next nets" card so it never has to compute (and
+  // never risks disagreeing with) its own answer. Deliberately NOT
+  // selectedDate itself, since that changes as the player browses the
+  // Attendance tab, and Home shouldn't follow them there.
+  const [loginNextNetsIso] = useState(nextNetsIsoForLogin);
   const [showFullDates, setShowFullDates] = useState(false);
   const [viewingPhoto, setViewingPhoto] = useState(null); // { name, photo, preserveAspect } | null
   const openPhoto = (name, photo, preserveAspect) => setViewingPhoto({ name, photo, preserveAspect });
@@ -6812,9 +7289,20 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
     const confirmedPlayers = players.filter((p) => votedIds.includes(p.id));
     const declinedPlayers = players.filter((p) => declinedIds.includes(p.id));
 
-    const subbed = (subs[activeMonth] || []).includes(authedPlayer.id);
-    const paid = !!(monthPayments && monthPayments[authedPlayer.id]);
-    const subscribedPlayers = players.filter((p) => (subs[activeMonth] || []).includes(p.id));
+    // activeMonth's own year/month, so the Subscription tab's forward
+    // browsing can compute "December of this year" as a plain cap rather
+    // than needing real wall-clock date math.
+    const [activeYear, activeMonthNum] = activeMonth.split("-").map(Number);
+    const subMaxOffset = 12 - activeMonthNum; // e.g. August(8) -> 4 more months (Sep-Dec)
+    const subViewMonth = `${activeYear}-${String(activeMonthNum + subMonthOffset).padStart(2, "0")}`;
+    const subViewIsCurrent = subMonthOffset === 0;
+
+    const subbed = (subs[subViewMonth] || []).includes(authedPlayer.id);
+    // A future month never has a real payment status yet — monthPayments
+    // is only ever resolved for activeMonth itself, and there's nothing
+    // to have paid for a month that hasn't started.
+    const paid = subViewIsCurrent ? !!(monthPayments && monthPayments[authedPlayer.id]) : false;
+    const subscribedPlayers = players.filter((p) => (subs[subViewMonth] || []).includes(p.id));
 
     return (
       <>
@@ -6839,6 +7327,15 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
             <button onClick={() => { setAuthedPlayerId(null); onBack(); }} style={{ ...iconBtnStyle, background: COLORS.pitchLight, borderRadius: 8, padding: "6px 10px", display: "flex", gap: 6 }}>
               <Icon size={14}>↩</Icon> <span style={{ fontSize: 12 }}>Switch player</span>
             </button>
+            {updatePlayerFcmToken && authedPlayer && (
+              <NotificationBell
+                enabled={!!authedPlayer.fcmToken}
+                busy={pushBusy}
+                error={!!pushError}
+                onToggle={handleTogglePush}
+                title="Notifications — matches, performers, payments, and more"
+              />
+            )}
           </div>
         </div>
         {switchTeam && (
@@ -6851,31 +7348,13 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
 
         <div className="w-500" style={{ margin: "0 auto", padding: 20, display: "flex", flexDirection: "column", gap: 16 }}>
           <BirthdayBanner players={players} teamName={teamRecord ? teamRecord.teamName : ""} />
-          {updatePlayerFcmToken && authedPlayer && (
-            <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 10 }}>
-                <div>
-                  <div style={{ fontSize: 12.5, fontWeight: 600 }}>🔔 Notifications</div>
-                  <div style={{ fontSize: 10.5, color: COLORS.inkSoft, marginTop: 2 }}>Matches, performers, payments, and more</div>
-                </div>
-                <button
-                  onClick={handleTogglePush}
-                  disabled={pushBusy}
-                  style={{
-                    flexShrink: 0, fontSize: 11.5, fontWeight: 700, borderRadius: 8, padding: "7px 12px", cursor: pushBusy ? "default" : "pointer",
-                    background: authedPlayer.fcmToken ? "#3B7A3E" : "transparent", color: authedPlayer.fcmToken ? "#fff" : COLORS.willow,
-                    border: `1px solid ${authedPlayer.fcmToken ? "#3B7A3E" : COLORS.willow}`, opacity: pushBusy ? 0.7 : 1,
-                  }}
-                >
-                  {pushBusy ? "…" : authedPlayer.fcmToken ? "On — tap to turn off" : "Turn on"}
-                </button>
-              </div>
-              {pushError && <div style={{ fontSize: 11, color: COLORS.leather, marginTop: 8 }}>{pushError}</div>}
-            </div>
-          )}
-          {setPlayerVideo && (
-            <HighlightClipCard player={authedPlayer} setPlayerVideo={setPlayerVideo} removePlayerVideo={removePlayerVideo} onView={openClip} />
-          )}
+          {pushError && <div style={{ background: "#FCEBEA", color: COLORS.leather, padding: "8px 12px", borderRadius: 8, fontSize: 13 }}>{pushError}</div>}
+          {/* Highlight clips used to live here — replaced by the rotating
+              team-photo banner. setPlayerVideo/removePlayerVideo are still
+              passed through and still work from the Players tab (admin
+              side); a player's own clips just aren't surfaced on their
+              Home tab anymore. */}
+          <TeamPhotoCarousel photoIds={teamPhotoIds} photos={photos} onView={(url) => openPhoto("Team photo", url)} />
           {isMonthLocked && (
             <div style={{ background: "#FAEEDA", color: "#633806", borderRadius: 10, padding: "10px 14px", fontSize: 12, display: "flex", alignItems: "center", gap: 6 }}>
               <Icon size={13}>🔒</Icon> {monthLabel(activeMonth)} is locked — votes and payments can't be changed right now.
@@ -6897,6 +7376,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
               toggleMatchAvailable={toggleMatchAvailable} toggleMatchNotAvailable={toggleMatchNotAvailable}
               toggleVoteFor={toggleVoteFor} toggleDeclineFor={toggleDeclineFor}
               onNavigate={setPlayerTab}
+              nextNetsIso={loginNextNetsIso}
             />
           )}
 
@@ -7052,24 +7532,42 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
           {playerTab === "subscription" && (
             <>
               <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 18 }}>
-                <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 2 }}>{monthLabel(activeMonth)}</div>
-                <div style={{ fontSize: 12, color: COLORS.inkSoft, marginBottom: 12 }}>₹{rates.subAmount} covers your share of nets fees and balls for the month.</div>
+                <div style={{ display: "flex", justifyContent: "center", marginBottom: 12 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.pitchLight, borderRadius: 10, padding: "6px 8px" }}>
+                    <button
+                      onClick={() => setSubMonthOffset((v) => Math.max(0, v - 1))}
+                      disabled={subMonthOffset === 0}
+                      style={{ ...iconBtnStyle, opacity: subMonthOffset === 0 ? 0.4 : 1, cursor: subMonthOffset === 0 ? "default" : "pointer" }}
+                    >
+                      <Icon size={16}>‹</Icon>
+                    </button>
+                    <div className="mono" style={{ fontSize: 13, minWidth: 128, textAlign: "center", color: COLORS.cream }}>{monthLabel(subViewMonth)}</div>
+                    <button
+                      onClick={() => setSubMonthOffset((v) => Math.min(subMaxOffset, v + 1))}
+                      disabled={subMonthOffset >= subMaxOffset}
+                      style={{ ...iconBtnStyle, opacity: subMonthOffset >= subMaxOffset ? 0.4 : 1, cursor: subMonthOffset >= subMaxOffset ? "default" : "pointer" }}
+                    >
+                      <Icon size={16}>›</Icon>
+                    </button>
+                  </div>
+                </div>
+                <div style={{ fontSize: 12, color: COLORS.inkSoft, marginBottom: 12, textAlign: "center" }}>₹{rates.subAmount} covers your share of nets fees and balls for the month.</div>
                 <button
-                  onClick={() => !isMonthLocked && toggleSub(authedPlayer.id)}
-                  disabled={isMonthLocked}
+                  onClick={() => !(subViewIsCurrent && isMonthLocked) && toggleSub(authedPlayer.id, subViewMonth)}
+                  disabled={subViewIsCurrent && isMonthLocked}
                   className="chip"
                   style={{
-                    width: "100%", cursor: isMonthLocked ? "not-allowed" : "pointer", borderRadius: 10, padding: "12px 16px", fontSize: 14, fontWeight: 600,
+                    width: "100%", cursor: (subViewIsCurrent && isMonthLocked) ? "not-allowed" : "pointer", borderRadius: 10, padding: "12px 16px", fontSize: 14, fontWeight: 600,
                     border: `1px solid ${subbed ? COLORS.leather : COLORS.line}`,
                     background: subbed ? COLORS.leather : "transparent",
                     color: subbed ? "#fff" : COLORS.ink,
-                    display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: isMonthLocked ? 0.6 : 1, marginBottom: subbed ? 10 : 0,
+                    display: "flex", alignItems: "center", justifyContent: "center", gap: 8, opacity: (subViewIsCurrent && isMonthLocked) ? 0.6 : 1, marginBottom: subbed ? 10 : 0,
                   }}
                 >
                   {subbed ? <Icon size={16}>✓</Icon> : null}
                   {subbed ? `Subscribed — ₹${rates.subAmount}` : `Tap to subscribe (₹${rates.subAmount})`}
                 </button>
-                {subbed && (
+                {subbed && subViewIsCurrent && (
                   <div style={{
                     borderRadius: 8, padding: "9px 10px", fontSize: 11, textAlign: "center", fontWeight: 600,
                     background: paid ? "#EAF3E4" : "#FAEEDA", color: paid ? "#3B6D11" : "#854F0B",
@@ -7077,6 +7575,56 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
                     {paid ? "✓ Payment confirmed by admin" : "⏳ Pending admin confirmation"}
                   </div>
                 )}
+                {subbed && !subViewIsCurrent && (
+                  <div style={{ borderRadius: 8, padding: "9px 10px", fontSize: 11, textAlign: "center", fontWeight: 600, background: COLORS.line, color: COLORS.inkSoft }}>
+                    Confirmed ahead of time — payment collection opens when {monthLabel(subViewMonth)} starts.
+                  </div>
+                )}
+                {subbed && subViewIsCurrent && !paid && (() => {
+                  // Nets-fee config only — no longer falls back to the
+                  // match payment details when a nets-fee-specific one
+                  // hasn't been set. A player paying their monthly
+                  // subscription should never see the match's QR/UPI here;
+                  // if nothing's configured yet, this section just doesn't
+                  // render (the pending pill above still shows on its own).
+                  const effectiveSubQr = (subscriptionPaymentDefault && subscriptionPaymentDefault.qr) || null;
+                  const effectiveSubUpiNumber = ((subscriptionPaymentDefault && subscriptionPaymentDefault.upiNumber) || "").trim();
+                  if (!effectiveSubQr && !effectiveSubUpiNumber) return null;
+                  const subPayUrl = isMobileDevice() && effectiveSubUpiNumber ? buildUpiDeepLink({
+                    upiId: effectiveSubUpiNumber, amount: rates.subAmount, payeeName: teamRecord ? teamRecord.teamName : "",
+                    note: `${teamRecord ? teamRecord.teamName : "Nets"} subscription - ${monthLabel(subViewMonth)}`,
+                  }) : null;
+                  return (
+                    <div style={{ marginTop: 12, paddingTop: 12, borderTop: `1px solid ${COLORS.line}` }}>
+                      {effectiveSubQr ? (
+                        <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 6 }}>
+                          {subPayUrl ? (
+                            <a href={subPayUrl} style={{ width: 132, height: 132, borderRadius: 10, overflow: "hidden", background: "#fff", boxShadow: "0 1px 4px rgba(0,0,0,0.15)", display: "block" }}>
+                              <img src={effectiveSubQr} alt="Payment QR code" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+                            </a>
+                          ) : (
+                            <div onClick={() => openPhoto("Payment QR code", effectiveSubQr)} style={{ width: 132, height: 132, borderRadius: 10, overflow: "hidden", background: "#fff", boxShadow: "0 1px 4px rgba(0,0,0,0.15)", cursor: "pointer" }}>
+                              <img src={effectiveSubQr} alt="Payment QR code" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+                            </div>
+                          )}
+                          <div style={{ fontSize: 11, color: COLORS.inkSoft, textAlign: "center" }}>
+                            {subPayUrl ? "Tap to pay via UPI app" : "Tap to enlarge, then scan to pay via UPI"}{effectiveSubUpiNumber ? <><br /><span className="mono">{effectiveSubUpiNumber}</span></> : null}
+                          </div>
+                        </div>
+                      ) : (
+                        subPayUrl ? (
+                          <a href={subPayUrl} style={{ display: "block", fontSize: 12, color: COLORS.inkSoft, textAlign: "center", textDecoration: "none" }}>
+                            Tap to pay via UPI app: <span className="mono">{effectiveSubUpiNumber}</span>
+                          </a>
+                        ) : (
+                          <div style={{ fontSize: 12, color: COLORS.inkSoft, textAlign: "center" }}>
+                            Pay via UPI: <span className="mono">{effectiveSubUpiNumber}</span>
+                          </div>
+                        )
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
               <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 18 }}>
@@ -7186,12 +7734,14 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
     if (!selectedId) { setError("Pick your name first."); return; }
     const hasPin = !!pins[selectedId];
     console.log("[TEAM-DEBUG] PlayerArea.handleContinue: teamCode=", teamRecord && teamRecord.teamCode, "selectedId=", selectedId, "selectedName=", players.find((p) => p.id === selectedId)?.name, "hasPin=", hasPin, "playersInScope=", players.length);
+    if (hasPin && pinLockout.isLocked) { setError(`Too many attempts — try again in ${pinLockout.remaining}s.`); return; }
     if (hasPin) {
       if (pinInput.length !== 4) { setError("Enter your 4-digit PIN."); return; }
       const hashed = await hashPin(pinInput);
       const matchesStoredHash = pins[selectedId] === hashed;
       console.log("[TEAM-DEBUG] PIN check result:", matchesStoredHash, "storedHash=", pins[selectedId], "computedHash=", hashed);
-      if (!matchesStoredHash) { setError("That PIN doesn't match. Try again."); return; }
+      if (!matchesStoredHash) { pinLockout.registerFailedAttempt(); setError("That PIN doesn't match. Try again."); return; }
+      pinLockout.reset();
       setAuthedPlayerId(selectedId);
     } else {
       if (pinInput.length !== 4) { setError("Choose a 4-digit PIN."); return; }
@@ -7442,6 +7992,7 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
               onChange={(e) => setPinInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
               onKeyDown={(e) => e.key === "Enter" && handleContinue()}
               placeholder="••••"
+              aria-label={hasPin ? "Enter your PIN" : "Set your PIN"}
               style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: hasPin ? 12 : 8 }}
             />
             {!hasPin && (
@@ -7452,12 +8003,16 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
                 onChange={(e) => setPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 4))}
                 onKeyDown={(e) => e.key === "Enter" && handleContinue()}
                 placeholder="Confirm PIN"
+                aria-label="Confirm your PIN"
                 style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: 12 }}
               />
             )}
             {error && <div style={{ color: "#F0A6A4", fontSize: 12, marginBottom: 10 }}>{error}</div>}
-            <button onClick={handleContinue} style={{ width: "100%", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 14, fontWeight: 600, cursor: "pointer" }}>
-              {hasPin ? "Continue" : "Set PIN & continue"}
+            <button
+              onClick={handleContinue} disabled={hasPin && pinLockout.isLocked}
+              style={{ width: "100%", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 14, fontWeight: 600, cursor: hasPin && pinLockout.isLocked ? "default" : "pointer", opacity: hasPin && pinLockout.isLocked ? 0.6 : 1 }}
+            >
+              {hasPin && pinLockout.isLocked ? `Try again in ${pinLockout.remaining}s` : hasPin ? "Continue" : "Set PIN & continue"}
             </button>
             {hasPin && submitPlayerPinResetRequest && (
               <button onClick={() => { setPreAuthView("forgot"); setError(""); }} style={{ width: "100%", background: "transparent", border: "none", color: "#9BAE9E", fontSize: 11.5, marginTop: 10, cursor: "pointer" }}>
@@ -7479,15 +8034,17 @@ function PlayerArea({ players, pins, setPins, authedPlayerId, setAuthedPlayerId,
 // already use — this doesn't own any state of its own, it's a different
 // front door onto data that already exists. The live-broadcast banner
 // isn't repeated here — it's already shown above every player tab.
-function PlayerHomeDashboard({ matches, days, authedPlayer, subs, monthPayments, activeMonth, rates, marketplace, toggleMatchAvailable, toggleMatchNotAvailable, toggleVoteFor, toggleDeclineFor, onNavigate }) {
+function PlayerHomeDashboard({ matches, days, authedPlayer, subs, monthPayments, activeMonth, rates, marketplace, toggleMatchAvailable, toggleMatchNotAvailable, toggleVoteFor, toggleDeclineFor, onNavigate, nextNetsIso }) {
   const today = todayISO();
-  const upcomingMatches = Object.values(matches || {}).filter((m) => m.date && m.date >= today).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const upcomingMatches = Object.values(matches || {}).filter((m) => m.date && m.date >= today && m.status !== "cancelled").sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   const nextMatch = upcomingMatches[0] || null;
   const matchAvailable = nextMatch ? (nextMatch.available || []).includes(authedPlayer.id) : false;
   const matchWaitlisted = nextMatch ? (nextMatch.waitlist || []).includes(authedPlayer.id) : false;
   const matchNotAvailable = nextMatch ? (nextMatch.notAvailable || []).includes(authedPlayer.id) : false;
 
-  const nextNetsIso = nextWeekday(today);
+  // nextNetsIso comes in as a prop now — resolved once at login by
+  // PlayerArea (nextNetsIsoForLogin), the same value the Attendance tab
+  // opens to by default, so this card and that tab can never disagree.
   const nextNetsData = days[nextNetsIso] || { votes: [], declined: [] };
   const netsAvailable = (nextNetsData.votes || []).includes(authedPlayer.id);
   const netsNotAvailable = (nextNetsData.declined || []).includes(authedPlayer.id);
@@ -7601,6 +8158,7 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
   // per-match state, matching how expandedId already handles "one thing
   // at a time" across this same list.
   const [copiedPerformersId, setCopiedPerformersId] = useState(null);
+  const [copiedEncouragementId, setCopiedEncouragementId] = useState(null);
   // A single shared "fetching GPS right now" flag, not per-match/per-role
   // state — a person only ever taps one "Use my current location" button
   // at a time from their own account, so there's nothing to disambiguate.
@@ -7626,6 +8184,13 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
     if (ok) {
       setCopiedPerformersId(m.id);
       setTimeout(() => setCopiedPerformersId(null), 2000);
+    }
+  }
+  async function handleCopyEncouragement(m) {
+    const ok = await copyText(buildTeamEncouragementMessage(teamName));
+    if (ok) {
+      setCopiedEncouragementId(m.id);
+      setTimeout(() => setCopiedEncouragementId(null), 2000);
     }
   }
 
@@ -7688,7 +8253,7 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
           : { label: "No response yet", bg: "#EEEAD9", text: COLORS.inkSoft };
 
         return (
-          <div key={m.id} className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, overflow: "hidden" }}>
+          <div key={m.id} className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, overflow: "hidden", opacity: m.status === "cancelled" ? 0.7 : 1 }}>
             <button onClick={() => setExpandedId(expanded ? null : m.id)} style={{ width: "100%", textAlign: "left", background: "transparent", border: "none", cursor: "pointer", padding: 16 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
                 <div>
@@ -7700,6 +8265,11 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
                 <Icon size={16} color={COLORS.inkSoft}>{expanded ? "←" : "→"}</Icon>
               </div>
               <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+                {m.status === "cancelled" && (
+                  <span style={{ fontSize: 11, fontWeight: 700, background: COLORS.leather, color: "#fff", padding: "3px 9px", borderRadius: 20 }}>
+                    CANCELLED
+                  </span>
+                )}
                 {m.liveMeetingId && (
                   <span style={{ fontSize: 11, fontWeight: 700, background: "#D62828", color: "#fff", padding: "3px 9px", borderRadius: 20 }}>
                     🔴 LIVE
@@ -7768,7 +8338,12 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
             <MatchTabBar tabs={PLAYER_MATCH_TABS} active={activeTab} onChange={setActiveTab}>
               {activeTab === "squad" && (
                 <>
-                  <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                  {m.status === "cancelled" && (
+                    <div style={{ background: "#FCEBEA", color: COLORS.leather, borderRadius: 10, padding: "10px 12px", fontSize: 12.5, fontWeight: 600, marginBottom: 12, display: "flex", alignItems: "center", gap: 6 }}>
+                      <Icon size={14}>🚫</Icon> This match was cancelled — RSVPs below are kept for the record.
+                    </div>
+                  )}
+                  <div style={{ display: "flex", gap: 8, marginBottom: 12, opacity: m.status === "cancelled" ? 0.5 : 1, pointerEvents: m.status === "cancelled" ? "none" : "auto" }}>
                     <button
                       onClick={() => toggleMatchAvailable(m.id, authedPlayer.id)}
                       className="chip"
@@ -7796,6 +8371,21 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
                       {notAvailable ? <Icon size={16}>✕</Icon> : null} Not Available
                     </button>
                   </div>
+
+                  {available && m.status !== "cancelled" && buildMatchCalendarLink(m, teamName) && (
+                    <a
+                      href={buildMatchCalendarLink(m, teamName)}
+                      target="_blank" rel="noreferrer"
+                      style={{
+                        display: "flex", alignItems: "center", justifyContent: "center", gap: 6,
+                        width: "100%", background: "transparent", border: `1px dashed ${COLORS.line}`, color: COLORS.inkSoft,
+                        borderRadius: 10, padding: "9px", fontSize: 12, fontWeight: 600, textDecoration: "none",
+                        marginBottom: 12, boxSizing: "border-box",
+                      }}
+                    >
+                      <Icon size={13}>📅</Icon> Add to Calendar
+                    </a>
+                  )}
 
                   <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, marginBottom: 12 }}>
                     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -8143,7 +8733,8 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
               )}
 
               {activeTab === "performers" && (
-                filledPerformerCount === 0 ? (
+                <>
+                {filledPerformerCount === 0 ? (
                   <div style={{ fontSize: 12, color: COLORS.inkSoft }}>Not announced yet.</div>
                 ) : (
                   <div style={{ background: "linear-gradient(135deg, #C08A45, #9A6B3C)", borderRadius: 12, padding: 16 }}>
@@ -8174,7 +8765,22 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
                       </WhatsAppShareLink>
                     </div>
                   </div>
-                )
+                )}
+                {/* Not gated on performers being filled in — a loss doesn't
+                    need a "best performer" named, and shouldn't require one
+                    just to send the team a lift-you-up message. */}
+                <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginTop: filledPerformerCount === 0 ? 0 : 10 }}>
+                  <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Lost today? Send the team a lift-up</div>
+                  <div style={{ display: "flex", gap: 8 }}>
+                    <button onClick={() => handleCopyEncouragement(m)} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: 9, fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                      {copiedEncouragementId === m.id ? <Icon size={13}>✅</Icon> : <Icon size={13}>⧉</Icon>} {copiedEncouragementId === m.id ? "Copied!" : "Copy"}
+                    </button>
+                    <WhatsAppShareLink text={buildTeamEncouragementMessage(teamName)} style={{ flex: 1, gap: 5, padding: "9px" }}>
+                      💬 Better luck next time
+                    </WhatsAppShareLink>
+                  </div>
+                </div>
+                </>
               )}
             </MatchTabBar>
             </div>
@@ -8269,6 +8875,7 @@ function RegisterView({
             value={regName}
             onChange={(e) => setRegName(e.target.value)}
             placeholder="e.g. Vinesh Kumar"
+            aria-label="Your name"
             style={{ width: "100%", background: COLORS.pitch, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", color: "#fff", fontSize: 13, marginBottom: 14, boxSizing: "border-box", outline: "none" }}
           />
 
@@ -8285,6 +8892,7 @@ function RegisterView({
             value={regPin}
             onChange={(e) => setRegPin(e.target.value.replace(/\D/g, "").slice(0, 4))}
             placeholder="••••"
+            aria-label="Choose a 4-digit PIN"
             style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: 10 }}
           />
           <input
@@ -8294,6 +8902,7 @@ function RegisterView({
             onChange={(e) => setRegPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 4))}
             onKeyDown={(e) => e.key === "Enter" && handleSubmit()}
             placeholder="Confirm PIN"
+            aria-label="Confirm PIN"
             style={{ width: "100%", textAlign: "center", letterSpacing: 8, fontSize: 20, border: `1px solid ${COLORS.pitchLight}`, borderRadius: 8, padding: "10px 12px", background: COLORS.pitch, color: "#fff", outline: "none", boxSizing: "border-box", marginBottom: 14 }}
           />
 
@@ -8311,7 +8920,7 @@ function RegisterView({
   );
 }
 
-function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote, setDayField, activeMonth, isLocked, weekendExceptions, addWeekendException, removeWeekendException, photos, onViewPhoto, notifyPendingVotesNudge, onNetsLiveStarted, onNetsLiveStopped, teamName }) {
+function DailyLog({ selectedDate, setSelectedDate, players, subs, dayData, toggleVote, setDayField, activeMonth, isLocked, weekendExceptions, addWeekendException, removeWeekendException, photos, onViewPhoto, notifyPendingVotesNudge, onNetsLiveStarted, onNetsLiveStopped, teamName }) {
   const [copied, setCopied] = useState(false);
   const [showFullDates, setShowFullDates] = useState(false);
   const [showAllPlayers, setShowAllPlayers] = useState(false);
@@ -8327,19 +8936,26 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
     .sort();
   const votedIds = dayData.votes || [];
   const declinedIds = dayData.declined || [];
-  const declinedPlayers = players.filter((p) => declinedIds.includes(p.id));
+  // Only this day's month's subscribers are eligible to be marked here —
+  // except a player who already has a vote or decline recorded for this
+  // specific day stays visible regardless, so an existing record (a guest
+  // who played before subscribing, someone who subscribed late) is never
+  // silently hidden or stranded with no way to toggle it back off.
+  const dayMonthSubIds = new Set((subs && subs[selectedDate.slice(0, 7)]) || []);
+  const visiblePlayers = players.filter((p) => dayMonthSubIds.has(p.id) || votedIds.includes(p.id) || declinedIds.includes(p.id));
+  const declinedPlayers = visiblePlayers.filter((p) => declinedIds.includes(p.id));
   // Genuinely no response yet — excludes anyone who already declined, so
   // the reminder below (and this count) doesn't nag someone who's already
   // told the app they can't make it.
-  const pendingPlayers = players.filter((p) => !votedIds.includes(p.id) && !declinedIds.includes(p.id));
+  const pendingPlayers = visiblePlayers.filter((p) => !votedIds.includes(p.id) && !declinedIds.includes(p.id));
 
   const selectedIdx = Math.max(0, dateOptions.indexOf(selectedDate));
   const compactStart = Math.min(selectedIdx, Math.max(0, dateOptions.length - 4));
   const compactDates = dateOptions.slice(compactStart, compactStart + 4);
 
   const PREVIEW_COUNT = 3;
-  const previewPlayers = players.slice(0, PREVIEW_COUNT);
-  const overflowCount = players.length - PREVIEW_COUNT;
+  const previewPlayers = visiblePlayers.slice(0, PREVIEW_COUNT);
+  const overflowCount = visiblePlayers.length - PREVIEW_COUNT;
 
   function buildPendingVotesMessage() {
     const lines = [
@@ -8452,7 +9068,7 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
                     {monthExceptions.map((iso) => (
                       <span key={iso} style={{ display: "flex", alignItems: "center", gap: 4, background: "#EEEAD9", borderRadius: 20, padding: "4px 8px 4px 10px", fontSize: 11 }}>
                         {fmtDateShort(iso)}
-                        <button onClick={() => removeWeekendException(iso)} style={{ background: "transparent", border: "none", cursor: "pointer", color: COLORS.inkSoft, padding: 0, fontSize: 13, lineHeight: 1 }}>×</button>
+                        <button onClick={() => removeWeekendException(iso)} aria-label={`Remove ${fmtDateShort(iso)} from added nets days`} style={{ background: "transparent", border: "none", cursor: "pointer", color: COLORS.inkSoft, padding: 0, fontSize: 13, lineHeight: 1 }}>×</button>
                       </span>
                     ))}
                   </div>
@@ -8505,9 +9121,11 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
         </div>
         {players.length === 0 ? (
           <div style={{ fontSize: 13, color: COLORS.inkSoft }}>Add players in the Players tab first.</div>
+        ) : visiblePlayers.length === 0 ? (
+          <div style={{ fontSize: 13, color: COLORS.inkSoft }}>No players subscribed for {monthLabel(selectedDate.slice(0, 7))} yet — subscribe them from the Subscription tab first.</div>
         ) : (
           <div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>
-            {(showAllPlayers ? players : previewPlayers).map((p) => {
+            {(showAllPlayers ? visiblePlayers : previewPlayers).map((p) => {
               const voted = votedIds.includes(p.id);
               return (
                 <button key={p.id} onClick={() => !isLocked && toggleVote(p.id)} disabled={isLocked} className="chip" style={{
@@ -8533,7 +9151,7 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
         )}
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 10, flexWrap: "wrap", gap: 6 }}>
           <div className="mono" style={{ fontSize: 12, color: COLORS.inkSoft }}>
-            {votedIds.length} of {players.length} confirmed
+            {votedIds.length} of {visiblePlayers.length} confirmed
             {declinedPlayers.length > 0 && <span style={{ color: "#9A3634" }}> · {declinedPlayers.length} not available</span>}
           </div>
           {pendingPlayers.length > 0 && (
@@ -8583,11 +9201,13 @@ function DailyLog({ selectedDate, setSelectedDate, players, dayData, toggleVote,
   );
 }
 
-function SubscriptionTab({ players, monthSubPlayers, toggleSub, activeMonth, totals, monthPayments, togglePaid, rates, isLocked, photos, onViewPhoto, notifySubReminderNudge }) {
+function SubscriptionTab({ players, monthSubPlayers, toggleSub, activeMonth, totals, monthPayments, togglePaid, rates, isLocked, photos, onViewPhoto, notifySubReminderNudge, paymentDefault, subscriptionPaymentDefault, teamName }) {
   const [copied, setCopied] = useState(false);
+  const [copiedNewMonth, setCopiedNewMonth] = useState(false);
   const [showAllPlayers, setShowAllPlayers] = useState(false);
   const [showAllPaid, setShowAllPaid] = useState(false);
   const pendingPlayers = monthSubPlayers.filter((pid) => !monthPayments[pid]);
+  const paidPlayers = monthSubPlayers.filter((pid) => monthPayments[pid]);
   const PREVIEW_COUNT = 3;
   const previewPlayers = players.slice(0, PREVIEW_COUNT);
   const overflowCount = players.length - PREVIEW_COUNT;
@@ -8599,8 +9219,15 @@ function SubscriptionTab({ players, monthSubPlayers, toggleSub, activeMonth, tot
     const lines = [];
     lines.push(`🏏 *Nets Fee Reminder — ${monthLabel(activeMonth)}*`);
     lines.push("");
+    // Paid players listed first, same ✅/⏳ convention buildMatchPaymentMessage
+    // and buildSettlementTextWhatsApp already use — this used to only list
+    // who still owed money, with no way to see who'd already settled up.
+    paidPlayers.forEach((pid) => {
+      const p = players.find((pl) => pl.id === pid);
+      if (p) lines.push(`✅ ${p.name}`);
+    });
     if (pendingPlayers.length === 0) {
-      lines.push("Everyone's paid up. Nothing pending!");
+      lines.push("", "Everyone's paid up. Nothing pending!");
     } else {
       pendingPlayers.forEach((pid) => {
         const p = players.find((pl) => pl.id === pid);
@@ -8621,6 +9248,53 @@ function SubscriptionTab({ players, monthSubPlayers, toggleSub, activeMonth, tot
     if (notifySubReminderNudge) notifySubReminderNudge(pendingPlayers);
   }
 
+  // Genuinely new — nothing in the app announced a new month before this.
+  // buildReminderText above only ever addresses people already subscribed
+  // and unpaid; this instead announces the month itself and asks people to
+  // opt in, payment details attached from the very first ask rather than
+  // making someone wait for the mid-month reminder to see them.
+  function buildNewMonthMessage() {
+    // Nets-fee config only — see the matching comment in
+    // buildSettlementTextWhatsApp for why this no longer falls back to the
+    // match payment config.
+    const netsUpiNumber = ((subscriptionPaymentDefault && subscriptionPaymentDefault.upiNumber) || "").trim();
+    const netsQrSet = !!(subscriptionPaymentDefault && subscriptionPaymentDefault.qr);
+    const subPayCardUrl = netsQrSet ? buildSubPayCardUrl(activeMonth) : null;
+    const lines = [];
+    lines.push(`🏏 *New Month — ${monthLabel(activeMonth)}*`);
+    lines.push("");
+    lines.push(`A new month has started! Please confirm your ${fmtINR(rates.subAmount)} monthly subscription by tapping "Subscribe" in the app.`);
+    if (subPayCardUrl) {
+      lines.push("");
+      lines.push(`Once subscribed, please pay ${fmtINR(rates.subAmount)} and update as paid against your name. Tap below to pay via UPI:`);
+      lines.push(subPayCardUrl);
+    } else if (netsUpiNumber) {
+      lines.push("");
+      lines.push(`Once subscribed, please pay ${fmtINR(rates.subAmount)} to ${netsUpiNumber} and update as paid against your name.`);
+    }
+    // Only shown once someone's actually opted in — this message often
+    // goes out a few days into the month, not necessarily on day one, so
+    // "nobody yet" and "here's who's already in" are both real states to
+    // handle, not just the empty-month case.
+    if (monthSubPlayers.length > 0) {
+      lines.push("");
+      lines.push("*Already subscribed*");
+      monthSubPlayers.forEach((pid) => {
+        const p = players.find((pl) => pl.id === pid);
+        if (!p) return;
+        lines.push(`${monthPayments[pid] ? "✅" : "⏳"} ${p.name}`);
+      });
+    }
+    lines.push("");
+    lines.push("Thanks for keeping the club running! 🙌");
+    return lines.join("\n");
+  }
+  async function handleCopyNewMonth() {
+    const ok = await copyText(buildNewMonthMessage());
+    setCopiedNewMonth(ok);
+    if (ok) setTimeout(() => setCopiedNewMonth(false), 2000);
+  }
+
   return (
     <div>
       {isLocked && (
@@ -8632,6 +9306,19 @@ function SubscriptionTab({ players, monthSubPlayers, toggleSub, activeMonth, tot
         {monthLabel(activeMonth)} subscription — ₹{rates.subAmount} per player
       </div>
       <div style={{ fontSize: 13, color: COLORS.inkSoft, marginBottom: 14 }}>Players opt in from Player Sign-in. Mark who's actually handed over the cash below.</div>
+
+      <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginBottom: 18 }}>
+        <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Starting a new month? Announce it with payment details</div>
+        <div style={{ display: "flex", gap: 8 }}>
+          <button onClick={handleCopyNewMonth} style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+            {copiedNewMonth ? <Icon size={13}>✅</Icon> : <Icon size={13}>⧉</Icon>} {copiedNewMonth ? "Copied!" : "Copy"}
+          </button>
+          <WhatsAppShareLink text={buildNewMonthMessage()} style={{ flex: 1, gap: 5, padding: "9px" }}>
+            💬 Announce new month
+          </WhatsAppShareLink>
+        </div>
+      </div>
+
       {players.length === 0 ? (
         <div style={{ fontSize: 13, color: COLORS.inkSoft }}>Add players in the Players tab first.</div>
       ) : (
@@ -8736,6 +9423,7 @@ function PlayersTab({ players, newPlayerName, setNewPlayerName, addPlayer, remov
   const [editingDobId, setEditingDobId] = useState(null);
   const [dobDraft, setDobDraft] = useState("");
   const [showAllRoster, setShowAllRoster] = useState(false);
+  const [rosterSearch, setRosterSearch] = useState("");
 
   const pendingList = Object.values(pendingRegistrations || {}).sort((a, b) => a.submittedAt.localeCompare(b.submittedAt));
   const resetRequestList = Object.values(playerPinResetRequests || {}).sort((a, b) => a.requestedAt.localeCompare(b.requestedAt));
@@ -8744,7 +9432,11 @@ function PlayersTab({ players, newPlayerName, setNewPlayerName, addPlayer, remov
   // lists — full detail rows here (avatar, lock, reset/delete, birthday,
   // clips), so a smaller cap than the compact chip grids elsewhere.
   const ROSTER_PREVIEW_ROWS = 5;
-  const shownRoster = showAllRoster ? players : players.slice(0, ROSTER_PREVIEW_ROWS);
+  const rosterQuery = rosterSearch.trim().toLowerCase();
+  // Searching shows every match at once — "show all"/preview paging only
+  // makes sense for browsing the whole roster, not for finding one name.
+  const rosterMatches = rosterQuery ? players.filter((p) => p.name.toLowerCase().includes(rosterQuery)) : players;
+  const shownRoster = rosterQuery ? rosterMatches : (showAllRoster ? players : players.slice(0, ROSTER_PREVIEW_ROWS));
   const rosterOverflow = players.length - ROSTER_PREVIEW_ROWS;
 
   async function handleApprove(id) {
@@ -8868,6 +9560,16 @@ function PlayersTab({ players, newPlayerName, setNewPlayerName, addPlayer, remov
           <Icon size={16}>+</Icon> Add
         </button>
       </div>
+      {players.length > 0 && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+          <button
+            onClick={() => downloadTextFile("player-roster.csv", buildRosterCSV(players, pins))}
+            style={{ background: "transparent", border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft, borderRadius: 7, padding: "6px 11px", fontSize: 11, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}
+          >
+            <Icon size={12}>⤓</Icon> Export roster (CSV)
+          </button>
+        </div>
+      )}
       {playerError && (
         <div style={{ background: "#FCEBEA", color: COLORS.leather, borderRadius: 8, padding: "8px 12px", fontSize: 12, marginBottom: 16 }}>
           {playerError}
@@ -8877,6 +9579,18 @@ function PlayersTab({ players, newPlayerName, setNewPlayerName, addPlayer, remov
         <div style={{ fontSize: 13, color: COLORS.inkSoft }}>No players yet. Add your squad above.</div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          {players.length > ROSTER_PREVIEW_ROWS && (
+            <input
+              value={rosterSearch}
+              onChange={(e) => setRosterSearch(e.target.value)}
+              placeholder="Search roster by name…"
+              aria-label="Search roster by name"
+              style={{ ...inputStyle, marginBottom: 2 }}
+            />
+          )}
+          {rosterQuery && rosterMatches.length === 0 && (
+            <div style={{ fontSize: 12.5, color: COLORS.inkSoft }}>No players match "{rosterSearch.trim()}".</div>
+          )}
           {shownRoster.map((p) => (
             <div key={p.id} style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 10, padding: "10px 14px" }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -8902,7 +9616,7 @@ function PlayersTab({ players, newPlayerName, setNewPlayerName, addPlayer, remov
                   {pins[p.id] && (
                     <button
                       onClick={() => { setConfirmResetId(confirmResetId === p.id ? null : p.id); setConfirmDeleteId(null); }}
-                      title="Reset PIN"
+                      title="Reset PIN" aria-label="Reset PIN"
                       style={{ background: "transparent", border: "none", color: COLORS.inkSoft, cursor: "pointer", padding: 4 }}
                     >
                       <Icon size={16}>🔑</Icon>
@@ -9006,7 +9720,7 @@ function PlayersTab({ players, newPlayerName, setNewPlayerName, addPlayer, remov
               )}
             </div>
           ))}
-          {rosterOverflow > 0 && (
+          {!rosterQuery && rosterOverflow > 0 && (
             <button onClick={() => setShowAllRoster((v) => !v)} style={{ width: "100%", background: "transparent", border: `1px dashed ${COLORS.line}`, color: COLORS.inkSoft, borderRadius: 8, padding: "8px", fontSize: 12, cursor: "pointer" }}>
               {showAllRoster ? "Show less" : `Show all ${players.length}`}
             </button>
@@ -9023,7 +9737,7 @@ function PlayersTab({ players, newPlayerName, setNewPlayerName, addPlayer, remov
 function SummaryTab({
   activeMonth, totals, carryForward, closingBalance, monthSubPlayers, players, monthDayEntries,
   setTab, setSelectedDate, monthPayments, rates, monthAdjustment, monthAdjustmentRaw, setAdjustmentValue, perPlayerExtra, onExportFullSeason,
-  isLocked, toggleMonthLock,
+  isLocked, toggleMonthLock, paymentDefault, subscriptionPaymentDefault,
 }) {
   const [exported, setExported] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -9083,15 +9797,65 @@ function SummaryTab({
   // line — so it uses plain "label: value" lines instead of a padded
   // table. See cleanField()/buildMatchAvailabilityMessage() near the top
   // of this file for the fuller explanation.
+  // Narrative, not a ledger dump — this used to just reformat the same
+  // `rows` array the text-file export uses, which meant every number was
+  // correct but nothing said what they added up to. Two sentences bookend
+  // the numbers instead: what got spent, what's been collected, and what
+  // the closing balance actually means for the team — plus a direct nudge
+  // when someone's still owed money, which is a separate fact from
+  // whether the club's in surplus or short overall (a surplus month can
+  // still have players who haven't paid yet).
   function buildSettlementTextWhatsApp() {
     const out = [];
     out.push(`🏏 *Cricket Nets Settlement — ${monthLabel(activeMonth)}*`);
     out.push("");
-    rows.forEach(([label, val]) => out.push(`${label}: ${val}`));
+    out.push(`This month the club used the nets for ${totals.hours} hours and went through ${totals.balls} new balls, costing ${fmtINR(totals.expense)} in total (${fmtINR(totals.netFee)} nets + ${fmtINR(totals.ballFee)} balls).`);
+    out.push("");
+    let subsLine = `${monthSubPlayers.length} players are subscribed this month at ${fmtINR(rates.subAmount)} each (${fmtINR(totals.expected)} expected). ${fmtINR(totals.collected)} collected so far`;
+    if (totals.pending > 0) subsLine += `, ${fmtINR(Math.max(totals.pending, 0))} still pending`;
+    out.push(subsLine + ".");
+    // Carry-in/manual adjustment are usually zero — only worth a line when
+    // one of them actually moved the numbers this month.
+    if (carryForward !== 0 || monthAdjustment !== 0) {
+      const extras = [];
+      if (carryForward !== 0) extras.push(`${fmtINR(carryForward)} carried forward from last month`);
+      if (monthAdjustment !== 0) extras.push(`a ${fmtINR(monthAdjustment)} manual adjustment`);
+      out.push(`(Also includes ${extras.join(" and ")}.)`);
+    }
     out.push("—————————————");
-    out.push(`${closingBalance < 0 ? "Shortfall" : "Balance"}: ${fmtINR(Math.abs(closingBalance))}`);
-    if (closingBalance < 0 && monthSubPlayers.length > 0) {
-      out.push(`Extra per player: ${fmtINR(perPlayerExtra)}`);
+    // Names the actual next month rather than just saying "next month" —
+    // this message and the one you'd see after navigating forward a
+    // month were answering two different questions ("what came in" vs
+    // "what's going out"), easy to read as a mismatch without the
+    // explicit month name tying them together.
+    const upcoming = monthLabel(nextMonthKey(activeMonth));
+    if (closingBalance < 0) {
+      out.push(`⚠️ *We're short by ${fmtINR(Math.abs(closingBalance))}* — covering it would take an extra ${fmtINR(perPlayerExtra)} from each of the ${monthSubPlayers.length} subscribed players. This won't carry into ${upcoming} as debt — it needs to be resolved now.`);
+    } else if (closingBalance > 0) {
+      out.push(`✅ *We're in surplus: ${fmtINR(closingBalance)}* — this will carry forward to ${upcoming}.`);
+    } else {
+      out.push(`✅ *Exactly balanced this month* — nothing carries forward to ${upcoming}, nothing extra needed.`);
+    }
+    if (totals.pending > 0 && monthSubPlayers.length > 0) {
+      const pendingCount = monthSubPlayers.filter((pid) => !monthPayments[pid]).length;
+      out.push(`🙏 ${fmtINR(Math.max(totals.pending, 0))} still pending from ${pendingCount} player${pendingCount === 1 ? "" : "s"} — please clear dues ASAP.`);
+      // Nets-fee payment details only — this used to fall back to the
+      // match payment config (paymentDefault) whenever the nets-fee one
+      // wasn't set, which meant a settlement message (entirely a nets-fee
+      // concern) could show a match's UPI number. Card-first, plain-text
+      // fallback, and quietly omitted if neither is set — never the match
+      // config, and never a card link the Worker has no QR to serve.
+      const netsUpiNumber = ((subscriptionPaymentDefault && subscriptionPaymentDefault.upiNumber) || "").trim();
+      const netsQrSet = !!(subscriptionPaymentDefault && subscriptionPaymentDefault.qr);
+      const subPayCardUrl = netsQrSet ? buildSubPayCardUrl(activeMonth) : null;
+      if (subPayCardUrl) {
+        out.push("");
+        out.push(`Pay ${fmtINR(rates.subAmount)} and update as paid against your name. Tap below to pay via UPI:`);
+        out.push(subPayCardUrl);
+      } else if (netsUpiNumber) {
+        out.push("");
+        out.push(`Pay ${fmtINR(rates.subAmount)} to ${netsUpiNumber} and update as paid against your name:`);
+      }
     }
 
     if (monthSubPlayers.length > 0) {
@@ -9107,9 +9871,21 @@ function SummaryTab({
     if (monthDayEntries.length > 0) {
       out.push("");
       out.push("*Day-by-day*");
+      // WhatsApp has no real tables — ```monospace``` is the one format
+      // where every character is the same width, so padding with spaces
+      // actually lines these columns up on screen instead of drifting the
+      // way the old colon-separated list did in normal proportional text.
+      // Weekday is dropped from each row (the date alone is enough, and
+      // still in order) to leave room for the columns on a phone screen.
+      out.push("```");
+      out.push(`${"Date".padEnd(8)}${"Hrs".padStart(5)}${"Balls".padStart(7)}`);
       monthDayEntries.forEach(([iso, v]) => {
-        out.push(`${fmtDateShort(iso)}: ${Number(v.hours || 0)}hr / ${Number(v.balls || 0)}b`);
+        const d = new Date(iso + "T00:00:00").toLocaleDateString("en-IN", { day: "2-digit", month: "short" });
+        const hrs = Number(v.hours || 0).toFixed(1);
+        const balls = String(Number(v.balls || 0));
+        out.push(`${d.padEnd(8)}${hrs.padStart(5)}${balls.padStart(7)}`);
       });
+      out.push("```");
     }
     return out.join("\n");
   }
@@ -9282,8 +10058,60 @@ function SummaryTab({
   );
 }
 
-function StatsTab({ players, days, photos, onViewPhoto }) {
-  const { stats, total } = useMemo(() => computeAttendanceStats(players, days), [players, days]);
+function StatsTab({ players, days, subs, photos, onViewPhoto }) {
+  // "month" (default) scopes attendance to one month at a time, with its
+  // own ‹ Month Year › navigator — independent of the shared admin-header
+  // one (which drives Summary/Subscription's activeMonth) so browsing
+  // Stats never silently changes what month those other tabs show.
+  // "all" keeps the original all-time aggregate, one tap away.
+  const [statsMode, setStatsMode] = useState("month");
+  const [statsMonth, setStatsMonth] = useState(() => monthKey(new Date()));
+
+  // Bounds the navigator to months that actually have a logged session, so
+  // there's nothing to gain from browsing further — and never past the
+  // current month, since there's no such thing as future attendance.
+  const monthsWithSessions = useMemo(
+    () => Array.from(new Set(Object.keys(days).map((iso) => iso.slice(0, 7)))).sort(),
+    [days]
+  );
+  const currentMonthKey = monthKey(new Date());
+  const earliestMonth = monthsWithSessions[0] || currentMonthKey;
+  const latestBound = monthsWithSessions.length > 0
+    ? (monthsWithSessions[monthsWithSessions.length - 1] > currentMonthKey ? monthsWithSessions[monthsWithSessions.length - 1] : currentMonthKey)
+    : currentMonthKey;
+
+  function shiftStatsMonth(delta) {
+    let [y, m] = statsMonth.split("-").map(Number);
+    m += delta;
+    if (m === 0) { m = 12; y -= 1; }
+    if (m === 13) { m = 1; y += 1; }
+    setStatsMonth(`${y}-${String(m).padStart(2, "0")}`);
+  }
+
+  const filteredDays = useMemo(() => {
+    if (statsMode === "all") return days;
+    const out = {};
+    Object.keys(days).forEach((iso) => { if (iso.slice(0, 7) === statsMonth) out[iso] = days[iso]; });
+    return out;
+  }, [days, statsMode, statsMonth]);
+
+  // "This month" scopes the player list too, not just the sessions — but
+  // strictly to that month's subscribers would silently drop anyone who
+  // actually showed up without subscribing (a guest, or someone who
+  // subscribed late). So the visible set is subscribed(month) ∪ anyone
+  // with a real attendance record that month — never hides a player who
+  // has data, only ones with neither a subscription nor an appearance.
+  // All-time is left unfiltered on purpose: no single month's subscriber
+  // list means anything across a whole season.
+  const scopedPlayers = useMemo(() => {
+    if (statsMode === "all") return players;
+    const monthSubIds = new Set((subs && subs[statsMonth]) || []);
+    const attendedIds = new Set();
+    Object.values(filteredDays).forEach((d) => (d.votes || []).forEach((pid) => attendedIds.add(pid)));
+    return players.filter((p) => monthSubIds.has(p.id) || attendedIds.has(p.id));
+  }, [players, subs, statsMode, statsMonth, filteredDays]);
+
+  const { stats, total } = useMemo(() => computeAttendanceStats(scopedPlayers, filteredDays), [scopedPlayers, filteredDays]);
   const [showAllStats, setShowAllStats] = useState(false);
   const STATS_PREVIEW_ROWS = 5;
   const shownStats = showAllStats ? stats : stats.slice(0, STATS_PREVIEW_ROWS);
@@ -9291,14 +10119,53 @@ function StatsTab({ players, days, photos, onViewPhoto }) {
 
   return (
     <div>
-      <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4 }}>All-time attendance</div>
-      <div style={{ fontSize: 13, color: COLORS.inkSoft, marginBottom: 16 }}>
-        Based on {total} logged session{total === 1 ? "" : "s"} across all months.
+      <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4 }}>
+        {statsMode === "all" ? "All-time attendance" : `${monthLabel(statsMonth)} attendance`}
+      </div>
+      <div style={{ fontSize: 13, color: COLORS.inkSoft, marginBottom: 14 }}>
+        Based on {total} logged session{total === 1 ? "" : "s"} {statsMode === "all" ? "across all months" : `in ${monthLabel(statsMonth)}`}.
+      </div>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap", marginBottom: 16 }}>
+        <div style={{ display: "inline-flex", background: COLORS.line, borderRadius: 9, padding: 3, gap: 2 }}>
+          <button
+            onClick={() => setStatsMode("month")}
+            style={{ border: "none", background: statsMode === "month" ? COLORS.leather : "transparent", color: statsMode === "month" ? "#fff" : COLORS.ink, borderRadius: 7, padding: "6px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+          >
+            This month
+          </button>
+          <button
+            onClick={() => setStatsMode("all")}
+            style={{ border: "none", background: statsMode === "all" ? COLORS.leather : "transparent", color: statsMode === "all" ? "#fff" : COLORS.ink, borderRadius: 7, padding: "6px 12px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}
+          >
+            All-time
+          </button>
+        </div>
+        {statsMode === "month" && (
+          <div style={{ display: "flex", alignItems: "center", gap: 6, background: COLORS.pitchLight, borderRadius: 10, padding: "6px 8px" }}>
+            <button
+              onClick={() => shiftStatsMonth(-1)}
+              disabled={statsMonth <= earliestMonth}
+              style={{ ...iconBtnStyle, opacity: statsMonth <= earliestMonth ? 0.4 : 1, cursor: statsMonth <= earliestMonth ? "default" : "pointer" }}
+            >
+              <Icon size={16}>‹</Icon>
+            </button>
+            <div className="mono" style={{ fontSize: 13, minWidth: 118, textAlign: "center", color: COLORS.cream }}>{monthLabel(statsMonth)}</div>
+            <button
+              onClick={() => shiftStatsMonth(1)}
+              disabled={statsMonth >= latestBound}
+              style={{ ...iconBtnStyle, opacity: statsMonth >= latestBound ? 0.4 : 1, cursor: statsMonth >= latestBound ? "default" : "pointer" }}
+            >
+              <Icon size={16}>›</Icon>
+            </button>
+          </div>
+        )}
       </div>
       {players.length === 0 ? (
         <div style={{ fontSize: 13, color: COLORS.inkSoft }}>Add players to see attendance stats.</div>
       ) : total === 0 ? (
-        <div style={{ fontSize: 13, color: COLORS.inkSoft }}>No sessions logged yet — stats will appear once you log some days.</div>
+        <div style={{ fontSize: 13, color: COLORS.inkSoft }}>
+          {statsMode === "all" ? "No sessions logged yet — stats will appear once you log some days." : `No sessions logged in ${monthLabel(statsMonth)}.`}
+        </div>
       ) : (
         <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
           {shownStats.map((s, i) => (
@@ -9327,7 +10194,31 @@ function StatsTab({ players, days, photos, onViewPhoto }) {
   );
 }
 
-function SettingsTab({ rates, setRateField, paymentDefault, setPaymentDefaultField }) {
+function SettingsTab({ rates, setRateField, paymentDefault, setPaymentDefaultField, subscriptionPaymentDefault, setSubscriptionPaymentDefaultField, adminPin, setAdminPin, teamPhotoIds, photos, addTeamPhoto, removeTeamPhoto }) {
+  const [currentPinInput, setCurrentPinInput] = useState("");
+  const [newPinInput, setNewPinInput] = useState("");
+  const [newPinConfirm, setNewPinConfirm] = useState("");
+  const [pinChangeError, setPinChangeError] = useState("");
+  const [pinChangeSuccess, setPinChangeSuccess] = useState(false);
+  const pinLockout = usePinLockout();
+
+  async function handleChangeAdminPin() {
+    setPinChangeError("");
+    setPinChangeSuccess(false);
+    if (pinLockout.isLocked) { setPinChangeError(`Too many attempts — try again in ${pinLockout.remaining}s.`); return; }
+    if (currentPinInput.length !== 4) { setPinChangeError("Enter your current 4-digit PIN."); return; }
+    const currentHashed = await hashPin(currentPinInput);
+    if (currentHashed !== adminPin) { pinLockout.registerFailedAttempt(); setPinChangeError("Current PIN doesn't match."); return; }
+    if (newPinInput.length !== 4) { setPinChangeError("Choose a new 4-digit PIN."); return; }
+    if (newPinInput !== newPinConfirm) { setPinChangeError("New PINs don't match."); return; }
+    pinLockout.reset();
+    const newHashed = await hashPin(newPinInput);
+    setAdminPin(newHashed);
+    setCurrentPinInput(""); setNewPinInput(""); setNewPinConfirm("");
+    setPinChangeSuccess(true);
+    setTimeout(() => setPinChangeSuccess(false), 3000);
+  }
+
   return (
     <div>
       <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4 }}>Rates</div>
@@ -9401,6 +10292,128 @@ function SettingsTab({ rates, setRateField, paymentDefault, setPaymentDefaultFie
           </PlainImageUpload>
           <div style={{ fontSize: 12, color: COLORS.inkSoft }}>{paymentDefault.qr ? "Tap to replace" : "Tap to upload a scannable QR code"}</div>
         </div>
+      </div>
+
+      <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4, marginTop: 28 }}>Nets fee payment details</div>
+      <div style={{ fontSize: 13, color: COLORS.inkSoft, marginBottom: 16 }}>
+        Shown to players when they pay their monthly subscription, and in the settlement and new-month messages. Kept separate from the match payment details above — leave blank and no payment link is shown until you set one here.
+      </div>
+      <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16 }}>
+        <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>UPI / phone number</div>
+        <input
+          value={subscriptionPaymentDefault.upiNumber}
+          onChange={(e) => setSubscriptionPaymentDefaultField("upiNumber", e.target.value)}
+          onBlur={(e) => setSubscriptionPaymentDefaultField("upiNumber", e.target.value.trim())}
+          placeholder="e.g. 9876543210 or name@upi"
+          style={{ ...inputStyle, marginBottom: 14 }}
+        />
+        <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>Payment QR code</div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12 }}>
+          <PlainImageUpload
+            maxDim={640} quality={0.92} onUpload={(dataUrl) => setSubscriptionPaymentDefaultField("qr", dataUrl)}
+            crop cropTitle="Position your QR code" cropConfirmLabel="Use this QR code"
+            cropInstructions="Drag so just the QR code sits inside the frame — crop out any surrounding app screenshot."
+          >
+            {(busy) => (
+              <div style={{
+                width: 64, height: 64, borderRadius: 10, overflow: "hidden", flexShrink: 0, cursor: "pointer",
+                background: "#fff", border: `1px solid ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "center",
+              }}>
+                {busy ? (
+                  <Icon size={14} color={COLORS.inkSoft}>…</Icon>
+                ) : subscriptionPaymentDefault.qr ? (
+                  <img src={subscriptionPaymentDefault.qr} alt="Payment QR code" style={{ width: "100%", height: "100%", objectFit: "contain" }} />
+                ) : (
+                  <Icon size={20} color={COLORS.inkSoft}>📷</Icon>
+                )}
+              </div>
+            )}
+          </PlainImageUpload>
+          <div style={{ fontSize: 12, color: COLORS.inkSoft }}>
+            {subscriptionPaymentDefault.qr ? "Tap to replace" : "Tap to upload a scannable QR code"}
+          </div>
+        </div>
+      </div>
+
+      <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4, marginTop: 28 }}>Team photos</div>
+      <div style={{ fontSize: 13, color: COLORS.inkSoft, marginBottom: 16 }}>
+        Shown as a rotating banner on each player's Home tab. Up to {TEAM_PHOTOS_MAX} photos.
+      </div>
+      <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16 }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {(teamPhotoIds || []).map((id) => {
+            const url = photos && photos[teamPhotoKey(id)];
+            if (!url) return null;
+            return (
+              <div key={id} style={{ width: 64, height: 64, borderRadius: 8, overflow: "hidden", position: "relative", flexShrink: 0 }}>
+                <img src={url} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+                <button
+                  onClick={() => removeTeamPhoto(id)}
+                  style={{ position: "absolute", top: 2, right: 2, width: 18, height: 18, borderRadius: "50%", background: "rgba(0,0,0,0.6)", color: "#fff", border: "none", fontSize: 10, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", padding: 0 }}
+                >
+                  ✕
+                </button>
+              </div>
+            );
+          })}
+          {(teamPhotoIds || []).length < TEAM_PHOTOS_MAX && (
+            <PlainImageUpload
+              maxDim={1200} quality={0.85} onUpload={(dataUrl) => addTeamPhoto(dataUrl)}
+              crop cropOutputWidth={TEAM_PHOTO_CROP_W} cropOutputHeight={TEAM_PHOTO_CROP_H}
+              cropTitle="Position this photo" cropConfirmLabel="Use this photo"
+              cropInstructions="Drag to fit the part of the photo you want in the banner."
+            >
+              {(busy) => (
+                <div style={{ width: 64, height: 64, borderRadius: 8, border: `1.5px dashed ${COLORS.line}`, display: "flex", alignItems: "center", justifyContent: "center", cursor: "pointer", fontSize: 20, color: COLORS.inkSoft, flexShrink: 0 }}>
+                  {busy ? "…" : "+"}
+                </div>
+              )}
+            </PlainImageUpload>
+          )}
+        </div>
+        <div style={{ fontSize: 10.5, color: COLORS.inkSoft, marginTop: 10 }}>{(teamPhotoIds || []).length} of {TEAM_PHOTOS_MAX} photos</div>
+      </div>
+
+      <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 4, marginTop: 28 }}>Admin PIN</div>
+      <div style={{ fontSize: 13, color: COLORS.inkSoft, marginBottom: 16 }}>
+        Change your admin PIN without going through Super Admin approval — you'll need to know your current one.
+      </div>
+      <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16 }}>
+        <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>Current PIN</div>
+        <input
+          className="pinbox" type="password" inputMode="numeric" maxLength={4}
+          value={currentPinInput}
+          onChange={(e) => setCurrentPinInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
+          placeholder="••••"
+          aria-label="Current admin PIN"
+          style={{ ...inputStyle, letterSpacing: 6, marginBottom: 14 }}
+        />
+        <div style={{ fontSize: 11, letterSpacing: 1, textTransform: "uppercase", color: COLORS.inkSoft, marginBottom: 8 }}>New PIN</div>
+        <input
+          className="pinbox" type="password" inputMode="numeric" maxLength={4}
+          value={newPinInput}
+          onChange={(e) => setNewPinInput(e.target.value.replace(/\D/g, "").slice(0, 4))}
+          placeholder="••••"
+          aria-label="New admin PIN"
+          style={{ ...inputStyle, letterSpacing: 6, marginBottom: 10 }}
+        />
+        <input
+          className="pinbox" type="password" inputMode="numeric" maxLength={4}
+          value={newPinConfirm}
+          onChange={(e) => setNewPinConfirm(e.target.value.replace(/\D/g, "").slice(0, 4))}
+          onKeyDown={(e) => e.key === "Enter" && handleChangeAdminPin()}
+          placeholder="Confirm new PIN"
+          aria-label="Confirm new admin PIN"
+          style={{ ...inputStyle, letterSpacing: 6, marginBottom: 12 }}
+        />
+        {pinChangeError && <div style={{ color: COLORS.leather, fontSize: 12, marginBottom: 10 }}>{pinChangeError}</div>}
+        {pinChangeSuccess && <div style={{ color: "#3B7A3E", fontSize: 12, marginBottom: 10 }}>✓ Admin PIN updated.</div>}
+        <button
+          onClick={handleChangeAdminPin} disabled={pinLockout.isLocked}
+          style={{ width: "100%", background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px", fontSize: 13, fontWeight: 600, cursor: pinLockout.isLocked ? "default" : "pointer", opacity: pinLockout.isLocked ? 0.6 : 1 }}
+        >
+          {pinLockout.isLocked ? `Try again in ${pinLockout.remaining}s` : "Update admin PIN"}
+        </button>
       </div>
     </div>
   );
@@ -9689,7 +10702,7 @@ function MarketplaceTab({ marketplace, photos, players, isAdmin, viewerId, teamN
           </div>
           <div style={{ display: "flex", gap: 8, marginBottom: 6, flexWrap: "wrap" }}>
             {form.photos.map((dataUrl, i) => (
-              <div key={i} style={{ width: 56, height: 56, borderRadius: 8, overflow: "hidden", position: "relative", flexShrink: 0 }}>
+              <div key={dataUrl} style={{ width: 56, height: 56, borderRadius: 8, overflow: "hidden", position: "relative", flexShrink: 0 }}>
                 <img src={dataUrl} alt="" style={{ width: "100%", height: "100%", objectFit: "cover" }} />
                 <button
                   onClick={() => updateForm("photos", form.photos.filter((_, idx) => idx !== i))}
@@ -9794,7 +10807,7 @@ function MarketplaceListingCard({ listing, photoList, players, photos, teamName,
             <div style={{ display: "flex", gap: 8, overflowX: "auto", marginBottom: 10, paddingBottom: 2 }}>
               {photoList.map((p, i) => (
                 <img
-                  key={i} src={p} alt={listing.title} onClick={() => onViewPhoto(listing.title, p, true)}
+                  key={p} src={p} alt={listing.title} onClick={() => onViewPhoto(listing.title, p, true)}
                   style={{ width: photoList.length > 1 ? 140 : "100%", maxHeight: 200, height: 200, objectFit: "cover", borderRadius: 10, cursor: "pointer", flexShrink: 0 }}
                 />
               ))}
@@ -9873,7 +10886,168 @@ function MarketplaceListingCard({ listing, photoList, players, photos, teamName,
 
 const EMPTY_MATCH_FORM = { matchType: "", groundName: "", date: "", time: "", overs: "", ballType: "", jersey: "", locationUrl: "", capacity: "", upiNumber: "", paymentQr: null, banner: null };
 
-function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, onMatchLiveStarted, onMatchLiveStopped, teamName }) {
+// Per-player ledger of unpaid match fees, shown at the top of the Matches
+// tab. Reads straight from the live matches (via computeMatchDues) and marks
+// payments through the same toggleMatchPaid the match card uses, so this and
+// the cards can never disagree. Renders nothing until there's a match with
+// a fee to track.
+function MatchDuesCard({ dues, toggleMatchPaid }) {
+  const [expanded, setExpanded] = useState(false);
+  const [view, setView] = useState("player");
+  const [query, setQuery] = useState("");
+  const [openPlayers, setOpenPlayers] = useState({});
+  const [copied, setCopied] = useState(false);
+  if (dues.open.length === 0 && dues.feeNotSet.length === 0) return null;
+
+  const q = query.trim().toLowerCase();
+  const nameById = {};
+  dues.byPlayer.forEach((r) => { nameById[r.id] = r.name; });
+  const allClear = dues.open.length === 0;
+  const message = buildMatchDuesMessage(dues);
+  async function handleCopy() {
+    const ok = await copyText(message);
+    setCopied(ok);
+    if (ok) setTimeout(() => setCopied(false), 2000);
+  }
+  const pill = (due, text) => (
+    <span className="mono" style={{ fontSize: 11, fontWeight: 700, padding: "3px 10px", borderRadius: 20, whiteSpace: "nowrap", background: due ? "#FAEEDA" : "#EAF3E4", color: due ? "#854F0B" : "#3B6D11" }}>{text}</span>
+  );
+  const paidBtn = (matchId, playerId, paid) => (
+    <button
+      onClick={() => toggleMatchPaid(matchId, playerId)}
+      style={{ border: `1px solid ${paid ? "transparent" : COLORS.line}`, background: paid ? "#EAF3E4" : "#fff", color: paid ? "#3B6D11" : COLORS.ink, borderRadius: 7, padding: "4px 9px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}
+    >
+      {paid ? "✓ Paid" : "Mark paid"}
+    </button>
+  );
+
+  return (
+    <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, marginBottom: 14, overflow: "hidden" }}>
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, background: "transparent", border: "none", padding: "12px 14px", cursor: "pointer", textAlign: "left" }}
+      >
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 700 }}>Match dues</div>
+          <div style={{ fontSize: 11, color: COLORS.inkSoft, marginTop: 2 }}>
+            {allClear ? "Every match fee is collected" : `${dues.owingCount} player${dues.owingCount === 1 ? "" : "s"} owing across ${dues.open.length} match${dues.open.length === 1 ? "" : "es"}`}
+          </div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+          {pill(!allClear, allClear ? "All clear" : fmtINR(dues.totalPending))}
+          <Icon size={12} color={COLORS.inkSoft}>{expanded ? "▲" : "▼"}</Icon>
+        </div>
+      </button>
+
+      {dues.feeNotSet.length > 0 && (
+        <div style={{ fontSize: 11, color: "#854F0B", background: "#FDF2E2", padding: "6px 14px" }}>
+          {dues.feeNotSet.length} match{dues.feeNotSet.length === 1 ? " has" : "es have"} players but no total cost yet — set one on the match to include {dues.feeNotSet.length === 1 ? "it" : "them"} here.
+        </div>
+      )}
+
+      {expanded && !allClear && (
+        <div style={{ padding: "12px 14px 14px", borderTop: `1px solid ${COLORS.line}` }}>
+          <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 10 }}>
+            <div style={{ display: "inline-flex", background: COLORS.line, borderRadius: 9, padding: 2, flexShrink: 0 }}>
+              {[["player", "By player"], ["match", "By match"]].map(([k, label]) => (
+                <button key={k} onClick={() => setView(k)} style={{ border: "none", background: view === k ? COLORS.leather : "transparent", color: view === k ? "#fff" : COLORS.ink, borderRadius: 7, padding: "5px 10px", fontSize: 11, fontWeight: 700, cursor: "pointer" }}>{label}</button>
+              ))}
+            </div>
+            <input value={query} onChange={(e) => setQuery(e.target.value)} placeholder="Search" aria-label="Search match dues" style={{ ...inputStyle, padding: "6px 9px", fontSize: 12, minWidth: 0 }} />
+          </div>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {view === "player" ? (
+              dues.byPlayer.filter((r) => !q || r.name.toLowerCase().includes(q)).map((r) => {
+                const isOpen = !!openPlayers[r.id];
+                return (
+                  <div key={r.id} style={{ background: "#fff", border: `1px solid ${COLORS.line}`, borderRadius: 10, overflow: "hidden" }}>
+                    <button onClick={() => setOpenPlayers((prev) => ({ ...prev, [r.id]: !prev[r.id] }))} style={{ width: "100%", display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, background: "transparent", border: "none", padding: "9px 12px", cursor: "pointer" }}>
+                      <span style={{ fontSize: 13, fontWeight: 600 }}>{r.name}</span>
+                      {pill(r.total > 0, r.total > 0 ? `${fmtINR(r.total)} due` : "All clear")}
+                    </button>
+                    {isOpen && (
+                      <div style={{ borderTop: `1px solid ${COLORS.line}`, padding: "6px 12px 8px", background: COLORS.card }}>
+                        {r.items.map((i) => (
+                          <div key={i.match.id} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 12, padding: "4px 0" }}>
+                            <span style={{ color: COLORS.inkSoft }}>{i.label} · {fmtINR(i.fee)}</span>
+                            {paidBtn(i.match.id, r.id, i.paid)}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            ) : (
+              dues.open.filter((o) => !q || o.label.toLowerCase().includes(q)).map((o) => (
+                <div key={o.match.id} style={{ background: "#fff", border: `1px solid ${COLORS.line}`, borderRadius: 10, overflow: "hidden" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, padding: "9px 12px" }}>
+                    <span style={{ fontSize: 13, fontWeight: 600 }}>{o.label}</span>
+                    {pill(true, `${o.unpaidIds.length} unpaid · ${fmtINR(o.unpaidIds.length * o.fee)}`)}
+                  </div>
+                  <div style={{ borderTop: `1px solid ${COLORS.line}`, padding: "6px 12px 8px", background: COLORS.card }}>
+                    {o.playedIds.map((pid) => (
+                      <div key={pid} style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8, fontSize: 12, padding: "4px 0" }}>
+                        <span style={{ color: COLORS.inkSoft }}>{nameById[pid] || "Player"} · {fmtINR(o.fee)}</span>
+                        {paidBtn(o.match.id, pid, (o.match.payments || {})[pid] != null)}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div style={{ display: "flex", gap: 8, marginTop: 12, flexWrap: "wrap" }}>
+            <button onClick={handleCopy} style={{ display: "flex", alignItems: "center", gap: 5, background: "transparent", border: `1px solid ${COLORS.line}`, color: COLORS.ink, borderRadius: 8, padding: "6px 11px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+              {copied ? <Icon size={12}>✅</Icon> : <Icon size={12}>⧉</Icon>} {copied ? "Copied!" : "Copy"}
+            </button>
+            <WhatsAppShareLink text={message} style={{ gap: 5, padding: "6px 11px", fontSize: 11 }}>
+              <Icon size={12}>💬</Icon> Share
+            </WhatsAppShareLink>
+            <button onClick={() => downloadTextFile("match-dues.csv", buildMatchDuesCSV(dues))} style={{ display: "flex", alignItems: "center", gap: 5, background: "transparent", border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft, borderRadius: 8, padding: "6px 11px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>
+              <Icon size={12}>⤓</Icon> CSV
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Read-only summary for a match that's been moved into an archive-year
+// document — no edit controls at all. Editing an archived match would mean
+// every write function (updateMatchField, toggleMatchPaid, deleteMatch...)
+// would need to know whether to save to the live `matches` doc or a specific
+// year's archive doc; keeping archived matches strictly read-only avoids
+// that whole class of bugs and matches how they're meant to be used —
+// as a settled historical record, not something still being edited.
+function ArchivedMatchSummary({ match }) {
+  const playedIds = computePlayedIds(match);
+  const payments = match.payments || {};
+  const paidCount = playedIds.filter((id) => payments[id] != null).length;
+  return (
+    <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 16, opacity: 0.85 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 8 }}>
+        <div>
+          <div style={{ fontSize: 14, fontWeight: 600 }}>{cleanField(match.matchType, "Match")} · {cleanField(match.groundName, "Ground TBD")}</div>
+          <div style={{ fontSize: 12, color: COLORS.inkSoft, marginTop: 2 }}>{match.date ? fmtMatchDate(match.date) : "No date set"}</div>
+        </div>
+        <span style={{ fontSize: 10, fontWeight: 700, background: COLORS.line, color: COLORS.inkSoft, padding: "3px 9px", borderRadius: 20, textTransform: "uppercase", letterSpacing: 0.3, whiteSpace: "nowrap" }}>Archived</span>
+      </div>
+      <div style={{ display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+        <span style={{ fontSize: 11, background: "#EEEAD9", color: COLORS.inkSoft, padding: "3px 9px", borderRadius: 20 }}>{(match.available || []).length} available</span>
+        <span style={{ fontSize: 11, background: "#EEEAD9", color: COLORS.inkSoft, padding: "3px 9px", borderRadius: 20 }}>{playedIds.length} played</span>
+        {match.totalCost ? (
+          <span style={{ fontSize: 11, background: "#EAF3E4", color: "#3B6D11", padding: "3px 9px", borderRadius: 20 }}>{paidCount} of {playedIds.length} paid · {fmtINR(match.totalCost)} total</span>
+        ) : null}
+      </div>
+    </div>
+  );
+}
+
+function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, updateMatchField, toggleMatchAvailable, toggleMatchNotAvailable, togglePlayed, toggleMatchPaid, deleteMatch, updateMatchCapacity, adminAddAvailable, adminAddNotAvailable, promoteFromWaitlist, addGuestPlayer, paymentDefault, uploadMatchBanner, removeMatchBanner, uploadMatchQr, removeMatchQr, setMatchPerformerField, clearMatchPerformer, onMatchLiveStarted, onMatchLiveStopped, teamName, archiveOldMatches }) {
   const [showNewForm, setShowNewForm] = useState(false);
   const [expandedId, setExpandedId] = useState(null);
   const [form, setForm] = useState(EMPTY_MATCH_FORM);
@@ -9882,8 +11056,100 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
   // field on this form at all; it's applied straight onto the new match
   // afterward, the same way the banner/QR photos already are).
   const [duplicatingFrom, setDuplicatingFrom] = useState(null);
+  const [matchSearch, setMatchSearch] = useState("");
+  // "Upcoming" vs "Completed" — Completed is date-range driven and can
+  // reach into archived years, Upcoming only ever looks at live matches.
+  const [viewTab, setViewTab] = useState("upcoming");
+  const today = todayISO();
+  const matchArchiveCutoff = isoDateDaysAgo(MATCH_ARCHIVE_RETENTION_DAYS);
+  const [completedFrom, setCompletedFrom] = useState(matchArchiveCutoff);
+  const [completedTo, setCompletedTo] = useState(today);
+  // Keyed by year (e.g. "2025") — populated only when a picked range
+  // actually reaches into it, and kept for the rest of this session so the
+  // same year is never fetched twice.
+  const [archiveCache, setArchiveCache] = useState({});
+  const [archiveFetching, setArchiveFetching] = useState(false);
+  const [archiveConfirm, setArchiveConfirm] = useState(false);
+  const [archiveBusy, setArchiveBusy] = useState(false);
+  const [archiveDone, setArchiveDone] = useState(null);
 
-  const matchList = Object.values(matches || {}).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const allMatches = Object.values(matches || {}).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const matchQuery = matchSearch.trim().toLowerCase();
+  const filterByQuery = (list) => matchQuery
+    ? list.filter((m) => `${m.groundName || ""} ${m.matchType || ""}`.toLowerCase().includes(matchQuery))
+    : list;
+  const upcomingMatches = allMatches.filter((m) => !m.date || m.date >= today);
+  const matchList = filterByQuery(upcomingMatches);
+  // Matches older than the retention window, still sitting in the live
+  // `matches` doc — what an "Archive old matches" tap would move out.
+  // Old matches that still have unpaid players are held back (see
+  // archiveOldMatches) — counted separately so the banner can say why they
+  // aren't offered instead of the count silently looking too low.
+  const knownPlayerIds = useMemo(() => new Set(players.map((p) => p.id)), [players]);
+  const oldMatches = allMatches.filter((m) => m.date && m.date < matchArchiveCutoff);
+  const readyToArchiveCount = oldMatches.filter((m) => matchUnpaidIds(m, knownPlayerIds).length === 0).length;
+  const heldBackForDuesCount = oldMatches.length - readyToArchiveCount;
+  const matchDues = useMemo(() => computeMatchDues(matches, players), [matches, players]);
+  // Which archive years the current Completed range would need that this
+  // session hasn't fetched yet — drives both the "tap Search" hint and
+  // exactly what runCompletedSearch actually goes and fetches.
+  const pendingArchiveYears = (() => {
+    if (!completedFrom || !completedTo || completedFrom > completedTo) return [];
+    if (completedFrom >= matchArchiveCutoff) return [];
+    const fromYear = Number(completedFrom.slice(0, 4));
+    const toYear = Math.min(Number(completedTo.slice(0, 4)), Number(matchArchiveCutoff.slice(0, 4)));
+    const years = [];
+    for (let y = fromYear; y <= toYear; y++) { if (!(String(y) in archiveCache)) years.push(y); }
+    return years;
+  })();
+  const completedResults = (() => {
+    if (!completedFrom || !completedTo || completedFrom > completedTo) return [];
+    const inRange = (m) => m.date && m.date >= completedFrom && m.date <= completedTo;
+    const live = allMatches.filter(inRange).map((m) => ({ ...m, __source: "live" }));
+    const archived = [];
+    Object.values(archiveCache).forEach((yearMatches) => {
+      Object.values(yearMatches || {}).forEach((m) => { if (inRange(m)) archived.push({ ...m, __source: "archive" }); });
+    });
+    const combined = [...live, ...archived].sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+    return filterByQuery(combined);
+  })();
+
+  async function runCompletedSearch() {
+    if (pendingArchiveYears.length === 0) return;
+    setArchiveFetching(true);
+    const fetched = {};
+    for (const y of pendingArchiveYears) {
+      let data = {};
+      try {
+        const res = await window.storage.get(`matchesArchive_${y}`);
+        if (res && res.value) data = JSON.parse(res.value);
+      } catch (e) {
+        console.error("Completed matches: failed to fetch archive year", y, e);
+      }
+      fetched[y] = data;
+    }
+    setArchiveCache((prev) => ({ ...prev, ...fetched }));
+    setArchiveFetching(false);
+  }
+
+  async function doArchiveOldMatches() {
+    setArchiveBusy(true);
+    const result = await archiveOldMatches();
+    setArchiveBusy(false);
+    setArchiveConfirm(false);
+    setArchiveDone(result);
+    // A year that was already cached this session (e.g. the admin searched
+    // that range before archiving) would otherwise keep showing the old,
+    // pre-archive contents — drop it so the next Completed search re-fetches
+    // the now-updated archive doc instead of serving stale cache.
+    if (result.years && result.years.length) {
+      setArchiveCache((prev) => {
+        const next = { ...prev };
+        result.years.forEach((y) => { delete next[y]; });
+        return next;
+      });
+    }
+  }
   // Every ground this team has ever used, derived from its own match data
   // — a new ground typed into any match becomes available here for the
   // next one without any separate list to maintain.
@@ -10059,28 +11325,143 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
         </div>
       )}
 
-      {matchList.length === 0 ? (
-        <div style={{ fontSize: 13, color: COLORS.inkSoft }}>No matches yet — create one above when a weekend game comes up.</div>
+      {allMatches.length > 0 && (
+        <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 10 }}>
+          <button
+            onClick={() => downloadTextFile("match-history.csv", buildMatchHistoryCSV(matches, players))}
+            style={{ background: "transparent", border: `1px solid ${COLORS.line}`, color: COLORS.inkSoft, borderRadius: 7, padding: "6px 11px", fontSize: 11, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", gap: 5 }}
+          >
+            <Icon size={12}>⤓</Icon> Export match history (CSV)
+          </button>
+        </div>
+      )}
+
+      {readyToArchiveCount > 0 && (
+        <div className="card-elevated" style={{ background: "#FDF2E2", border: "1px solid #F0DCB0", borderRadius: 10, padding: "10px 12px", marginBottom: 14, fontSize: 12, color: "#854F0B" }}>
+          {!archiveConfirm ? (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+              <span>{readyToArchiveCount} match{readyToArchiveCount === 1 ? "" : "es"} older than 3 months can be archived to keep this list fast. Nothing is deleted — they stay available under Completed.</span>
+              <button onClick={() => setArchiveConfirm(true)} style={{ background: "#854F0B", color: "#fff", border: "none", borderRadius: 7, padding: "6px 12px", fontSize: 11, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>Archive old matches</button>
+            </div>
+          ) : (
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10, flexWrap: "wrap" }}>
+              <span>Move {readyToArchiveCount} match{readyToArchiveCount === 1 ? "" : "es"} out of the live list now?</span>
+              <div style={{ display: "flex", gap: 8 }}>
+                <button onClick={() => setArchiveConfirm(false)} disabled={archiveBusy} style={{ background: "transparent", border: "1px solid #F0DCB0", color: "#854F0B", borderRadius: 7, padding: "6px 12px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>Cancel</button>
+                <button onClick={doArchiveOldMatches} disabled={archiveBusy} style={{ background: "#854F0B", color: "#fff", border: "none", borderRadius: 7, padding: "6px 12px", fontSize: 11, fontWeight: 600, cursor: "pointer" }}>{archiveBusy ? "Archiving…" : "Yes, archive"}</button>
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+      {archiveDone && archiveDone.archived > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3B6D11", background: "#EAF3E4", borderRadius: 8, padding: "7px 11px", marginBottom: 14 }}>
+          <Icon size={12}>✓</Icon> Archived {archiveDone.archived} match{archiveDone.archived === 1 ? "" : "es"}. Find them under Completed.
+        </div>
+      )}
+      {heldBackForDuesCount > 0 && (
+        <div style={{ fontSize: 11, color: COLORS.inkSoft, marginBottom: 14 }}>
+          {heldBackForDuesCount} older match{heldBackForDuesCount === 1 ? " is" : "es are"} staying live because {heldBackForDuesCount === 1 ? "it still has" : "they still have"} unpaid players — {heldBackForDuesCount === 1 ? "it'll" : "they'll"} be offered for archiving once fully paid.
+        </div>
+      )}
+
+      <MatchDuesCard dues={matchDues} toggleMatchPaid={toggleMatchPaid} />
+
+      <div style={{ display: "flex", gap: 6, marginBottom: 12, background: COLORS.line, borderRadius: 10, padding: 3 }}>
+        <button
+          onClick={() => setViewTab("upcoming")}
+          style={{ flex: 1, background: viewTab === "upcoming" ? COLORS.card : "transparent", border: "none", borderRadius: 8, padding: "8px", fontSize: 12, fontWeight: 600, color: viewTab === "upcoming" ? COLORS.ink : COLORS.inkSoft, cursor: "pointer" }}
+        >Upcoming</button>
+        <button
+          onClick={() => setViewTab("completed")}
+          style={{ flex: 1, background: viewTab === "completed" ? COLORS.card : "transparent", border: "none", borderRadius: 8, padding: "8px", fontSize: 12, fontWeight: 600, color: viewTab === "completed" ? COLORS.ink : COLORS.inkSoft, cursor: "pointer" }}
+        >Completed</button>
+      </div>
+
+      {allMatches.length > 5 && (
+        <input
+          value={matchSearch}
+          onChange={(e) => setMatchSearch(e.target.value)}
+          placeholder="Search matches by ground or type…"
+          aria-label="Search matches by ground or type"
+          style={{ ...inputStyle, marginBottom: 10 }}
+        />
+      )}
+
+      {viewTab === "upcoming" ? (
+        allMatches.length === 0 ? (
+          <div style={{ fontSize: 13, color: COLORS.inkSoft }}>No matches yet — create one above when a weekend game comes up.</div>
+        ) : matchList.length === 0 ? (
+          <div style={{ fontSize: 13, color: COLORS.inkSoft }}>{matchQuery ? `No matches match "${matchSearch.trim()}".` : "No upcoming matches — check the Completed tab for past ones."}</div>
+        ) : (
+          <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+            {matchList.map((m) => (
+              <MatchCard
+                key={m.id} match={m} players={players} photos={photos} onViewPhoto={onViewPhoto}
+                expanded={expandedId === m.id}
+                onToggleExpand={() => setExpandedId(expandedId === m.id ? null : m.id)}
+                updateMatchField={updateMatchField} toggleMatchAvailable={toggleMatchAvailable} toggleMatchNotAvailable={toggleMatchNotAvailable}
+                togglePlayed={togglePlayed} toggleMatchPaid={toggleMatchPaid} deleteMatch={deleteMatch}
+                updateMatchCapacity={updateMatchCapacity} adminAddAvailable={adminAddAvailable} adminAddNotAvailable={adminAddNotAvailable}
+                promoteFromWaitlist={promoteFromWaitlist} addGuestPlayer={addGuestPlayer}
+                paymentDefault={paymentDefault} knownGrounds={knownGrounds} knownGroundLocations={knownGroundLocations}
+                uploadMatchBanner={uploadMatchBanner} removeMatchBanner={removeMatchBanner}
+                uploadMatchQr={uploadMatchQr} removeMatchQr={removeMatchQr}
+                setMatchPerformerField={setMatchPerformerField} clearMatchPerformer={clearMatchPerformer}
+                onDuplicate={duplicateMatch}
+                onMatchLiveStarted={onMatchLiveStarted} onMatchLiveStopped={onMatchLiveStopped}
+                teamName={teamName}
+              />
+            ))}
+          </div>
+        )
       ) : (
-        <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-          {matchList.map((m) => (
-            <MatchCard
-              key={m.id} match={m} players={players} photos={photos} onViewPhoto={onViewPhoto}
-              expanded={expandedId === m.id}
-              onToggleExpand={() => setExpandedId(expandedId === m.id ? null : m.id)}
-              updateMatchField={updateMatchField} toggleMatchAvailable={toggleMatchAvailable} toggleMatchNotAvailable={toggleMatchNotAvailable}
-              togglePlayed={togglePlayed} toggleMatchPaid={toggleMatchPaid} deleteMatch={deleteMatch}
-              updateMatchCapacity={updateMatchCapacity} adminAddAvailable={adminAddAvailable} adminAddNotAvailable={adminAddNotAvailable}
-              promoteFromWaitlist={promoteFromWaitlist} addGuestPlayer={addGuestPlayer}
-              paymentDefault={paymentDefault} knownGrounds={knownGrounds} knownGroundLocations={knownGroundLocations}
-              uploadMatchBanner={uploadMatchBanner} removeMatchBanner={removeMatchBanner}
-              uploadMatchQr={uploadMatchQr} removeMatchQr={removeMatchQr}
-              setMatchPerformerField={setMatchPerformerField} clearMatchPerformer={clearMatchPerformer}
-              onDuplicate={duplicateMatch}
-              onMatchLiveStarted={onMatchLiveStarted} onMatchLiveStopped={onMatchLiveStopped}
-              teamName={teamName}
-            />
-          ))}
+        <div>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10, flexWrap: "wrap" }}>
+            <input type="date" value={completedFrom} max={completedTo || today} onChange={(e) => setCompletedFrom(e.target.value)} style={{ ...inputStyle, flex: "1 1 130px" }} />
+            <span style={{ fontSize: 12, color: COLORS.inkSoft }}>to</span>
+            <input type="date" value={completedTo} min={completedFrom} max={today} onChange={(e) => setCompletedTo(e.target.value)} style={{ ...inputStyle, flex: "1 1 130px" }} />
+            {pendingArchiveYears.length > 0 && (
+              <button onClick={runCompletedSearch} disabled={archiveFetching} style={{ background: COLORS.willow, color: "#fff", border: "none", borderRadius: 8, padding: "10px 14px", fontSize: 12, fontWeight: 600, cursor: "pointer", whiteSpace: "nowrap" }}>
+                {archiveFetching ? "Loading…" : "Search"}
+              </button>
+            )}
+          </div>
+          {completedFrom && completedTo && completedFrom > completedTo ? (
+            <div style={{ fontSize: 13, color: COLORS.inkSoft }}>"From" date is after "to" date.</div>
+          ) : pendingArchiveYears.length > 0 ? (
+            <div style={{ fontSize: 11.5, color: COLORS.inkSoft, marginBottom: 10 }}>
+              This range includes {pendingArchiveYears.length === 1 ? "an archived year" : "archived years"} not loaded yet ({pendingArchiveYears.join(", ")}) — tap Search to fetch.
+            </div>
+          ) : null}
+          {completedResults.length === 0 ? (
+            <div style={{ fontSize: 13, color: COLORS.inkSoft }}>No completed matches in this range.</div>
+          ) : (
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {completedResults.map((m) => (
+                m.__source === "archive" ? (
+                  <ArchivedMatchSummary key={m.id} match={m} />
+                ) : (
+                  <MatchCard
+                    key={m.id} match={m} players={players} photos={photos} onViewPhoto={onViewPhoto}
+                    expanded={expandedId === m.id}
+                    onToggleExpand={() => setExpandedId(expandedId === m.id ? null : m.id)}
+                    updateMatchField={updateMatchField} toggleMatchAvailable={toggleMatchAvailable} toggleMatchNotAvailable={toggleMatchNotAvailable}
+                    togglePlayed={togglePlayed} toggleMatchPaid={toggleMatchPaid} deleteMatch={deleteMatch}
+                    updateMatchCapacity={updateMatchCapacity} adminAddAvailable={adminAddAvailable} adminAddNotAvailable={adminAddNotAvailable}
+                    promoteFromWaitlist={promoteFromWaitlist} addGuestPlayer={addGuestPlayer}
+                    paymentDefault={paymentDefault} knownGrounds={knownGrounds} knownGroundLocations={knownGroundLocations}
+                    uploadMatchBanner={uploadMatchBanner} removeMatchBanner={removeMatchBanner}
+                    uploadMatchQr={uploadMatchQr} removeMatchQr={removeMatchQr}
+                    setMatchPerformerField={setMatchPerformerField} clearMatchPerformer={clearMatchPerformer}
+                    onDuplicate={duplicateMatch}
+                    onMatchLiveStarted={onMatchLiveStarted} onMatchLiveStopped={onMatchLiveStopped}
+                    teamName={teamName}
+                  />
+                )
+              ))}
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -10094,6 +11475,12 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
     setCopiedPerformers(ok);
     if (ok) setTimeout(() => setCopiedPerformers(false), 2000);
   }
+  const [copiedEncouragement, setCopiedEncouragement] = useState(false);
+  async function handleCopyEncouragement() {
+    const ok = await copyText(buildTeamEncouragementMessage(teamName));
+    setCopiedEncouragement(ok);
+    if (ok) setTimeout(() => setCopiedEncouragement(false), 2000);
+  }
   const [copiedCarpool, setCopiedCarpool] = useState(false);
   async function handleCopyCarpool() {
     const ok = await copyText(buildCarpoolMessage(match, players, teamName));
@@ -10101,6 +11488,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
     if (ok) setTimeout(() => setCopiedCarpool(false), 2000);
   }
   const [copiedAvail, setCopiedAvail] = useState(false);
+  const [copiedReminder, setCopiedReminder] = useState(false);
   const [copiedPay, setCopiedPay] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showAddAvailable, setShowAddAvailable] = useState(false);
@@ -10154,6 +11542,11 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
     setCopiedAvail(ok);
     if (ok) setTimeout(() => setCopiedAvail(false), 2000);
   }
+  async function handleCopyReminder() {
+    const ok = await copyText(buildMatchReminderMessage(match));
+    setCopiedReminder(ok);
+    if (ok) setTimeout(() => setCopiedReminder(false), 2000);
+  }
   async function handleCopyPay() {
     const ok = await copyText(buildMatchPaymentMessage(match, players, paymentDefault));
     setCopiedPay(ok);
@@ -10190,7 +11583,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
 
   return (
     <>
-    <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, overflow: "hidden" }}>
+    <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, overflow: "hidden", opacity: match.status === "cancelled" ? 0.7 : 1 }}>
       <div style={{ padding: 16 }}>
         <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
           <div onClick={onToggleExpand} style={{ cursor: "pointer", minWidth: 0, flex: 1 }}>
@@ -10203,25 +11596,37 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
             {onDuplicate && (
               <button
                 onClick={() => onDuplicate(match)}
-                title="Duplicate this match — opens a new match form pre-filled with its details"
+                title="Duplicate this match — opens a new match form pre-filled with its details" aria-label="Duplicate this match — opens a new match form pre-filled with its details"
                 style={{ width: 28, height: 28, borderRadius: 8, border: `1px solid ${COLORS.willow}`, background: "transparent", color: COLORS.willow, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 13, padding: 0 }}
               >
                 ⎘
               </button>
             )}
             <button
+              onClick={() => updateMatchField(match.id, "status", match.status === "cancelled" ? "active" : "cancelled")}
+              title={match.status === "cancelled" ? "Reactivate this match" : "Cancel this match — keeps RSVPs and history, just marks it called off"}
+              style={{ width: 28, height: 28, borderRadius: 8, border: `1px solid ${COLORS.willow}`, background: "transparent", color: COLORS.willow, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, padding: 0 }}
+            >
+              {match.status === "cancelled" ? "↩" : "🚫"}
+            </button>
+            <button
               onClick={() => setConfirmDelete(true)}
-              title="Delete this match"
+              title="Delete this match" aria-label="Delete this match"
               style={{ width: 28, height: 28, borderRadius: 8, border: `1px solid ${COLORS.leather}`, background: "transparent", color: COLORS.leather, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 12, padding: 0 }}
             >
               🗑️
             </button>
-            <button onClick={onToggleExpand} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 4, display: "flex" }}>
+            <button onClick={onToggleExpand} aria-label={expanded ? "Collapse match details" : "Expand match details"} style={{ background: "transparent", border: "none", cursor: "pointer", padding: 4, display: "flex" }}>
               <Icon size={16} color={COLORS.inkSoft}>{expanded ? "←" : "→"}</Icon>
             </button>
           </div>
         </div>
         <div onClick={onToggleExpand} style={{ cursor: "pointer", display: "flex", gap: 8, marginTop: 10, flexWrap: "wrap" }}>
+          {match.status === "cancelled" && (
+            <span style={{ fontSize: 11, fontWeight: 700, background: COLORS.leather, color: "#fff", padding: "3px 9px", borderRadius: 20 }}>
+              CANCELLED
+            </span>
+          )}
           {match.liveMeetingId && (
             <span style={{ fontSize: 11, fontWeight: 700, background: "#D62828", color: "#fff", padding: "3px 9px", borderRadius: 20, display: "flex", alignItems: "center", gap: 4 }}>
               🔴 LIVE
@@ -10238,7 +11643,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
 
       {confirmDelete && (
         <div style={{ margin: "0 16px 16px", background: "#FCEBEA", borderRadius: 8, padding: 10 }}>
-          <div style={{ fontSize: 12, color: COLORS.leather, marginBottom: 8 }}>Delete this match and all its data? This can't be undone.</div>
+          <div style={{ fontSize: 12, color: COLORS.leather, marginBottom: 8 }}>Delete this match and all its data? This can't be undone. (Prefer "Cancel this match" instead if you just want to keep the record.)</div>
           <div style={{ display: "flex", gap: 8 }}>
             <button onClick={() => setConfirmDelete(false)} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 6, padding: "8px", fontSize: 12, cursor: "pointer" }}>Cancel</button>
             <button onClick={() => deleteMatch(match.id)} style={{ flex: 1, background: COLORS.leather, color: "#fff", border: "none", borderRadius: 6, padding: "8px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>Delete</button>
@@ -10523,6 +11928,20 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                     💬 Share
                   </WhatsAppShareLink>
                 </div>
+
+                {/* Day-before reminder — separate from the availability ask
+                    above: no roster/RSVP list, just ball type, dress code,
+                    and reach-on-time, in the same voice an admin would
+                    actually type this by hand. Tap-to-share like every
+                    other message here, nothing sends itself. */}
+                <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                  <button onClick={handleCopyReminder} style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 5, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: "9px", fontSize: 12, fontWeight: 600, cursor: "pointer" }}>
+                    {copiedReminder ? <Icon size={13}>✅</Icon> : <Icon size={13}>⧉</Icon>} {copiedReminder ? "Copied!" : "Copy reminder"}
+                  </button>
+                  <WhatsAppShareLink text={buildMatchReminderMessage(match)} style={{ flex: 1, gap: 5, padding: "9px" }}>
+                    💬 Send reminder
+                  </WhatsAppShareLink>
+                </div>
               </>
             )}
 
@@ -10683,7 +12102,7 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                                       style={{ width: 26, height: 26, borderRadius: 6, objectFit: "cover", cursor: "pointer", border: `1px solid ${COLORS.line}`, flexShrink: 0 }}
                                     />
                                   ) : (
-                                    <span title="Proof uploaded — loading…" style={{ fontSize: 12, flexShrink: 0 }}>📎</span>
+                                    <span title="Proof uploaded — loading…" aria-label="Proof uploaded — loading…" style={{ fontSize: 12, flexShrink: 0 }}>📎</span>
                                   )
                                 )}
                                 <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{p.name}</span>
@@ -10731,7 +12150,8 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
             )}
 
             {activeTab === "performers" && (
-              playedPlayers.length === 0 ? (
+              <>
+              {playedPlayers.length === 0 ? (
                 <div style={{ fontSize: 12, color: COLORS.inkSoft }}>Mark who played (in the Squad tab) to start tagging performers.</div>
               ) : (
                 <div>
@@ -10796,7 +12216,21 @@ function MatchCard({ match, players, photos, onViewPhoto, expanded, onToggleExpa
                     </div>
                   )}
                 </div>
-              )
+              )}
+              {/* Not gated on playedPlayers/performers — a loss doesn't
+                  need "who played" tagged to send the team a lift-up. */}
+              <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 14, marginTop: 10 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, marginBottom: 8 }}>Lost today? Send the team a lift-up</div>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={handleCopyEncouragement} style={{ flex: 1, background: "transparent", border: `1px solid ${COLORS.line}`, borderRadius: 8, padding: 9, fontSize: 12, fontWeight: 600, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 6 }}>
+                    {copiedEncouragement ? <Icon size={13}>✅</Icon> : <Icon size={13}>⧉</Icon>} {copiedEncouragement ? "Copied!" : "Copy"}
+                  </button>
+                  <WhatsAppShareLink text={buildTeamEncouragementMessage(teamName)} style={{ flex: 1, gap: 5, padding: "9px" }}>
+                    💬 Better luck next time
+                  </WhatsAppShareLink>
+                </div>
+              </div>
+              </>
             )}
 
             {activeTab === "settings" && (

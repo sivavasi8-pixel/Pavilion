@@ -11,6 +11,10 @@
 //    UPI id, and payee name are looked up here from Firestore rather than
 //    riding along in the URL, so the link isn't the whole message's worth
 //    of query string when it lands as visible text in WhatsApp.
+//    /qr-image-sub and /sp/:token are the same trick for nets-fee
+//    subscription payments instead of a match — /sp/:token carries
+//    team+monthKey (there's no match to point at), and the amount comes
+//    from the team's rates.subAmount instead of a match's totalCost split.
 // 3. Live video broker (POST /live/start, /live/join, /live/end) — a thin,
 //    authenticated relay between the browser and Cloudflare RealtimeKit's
 //    own REST API. The browser never sees the RealtimeKit API key; it only
@@ -254,6 +258,51 @@ async function handleQrImage(url, env) {
   });
 }
 
+// Same job as handleQrImage above, but for nets-fee/subscription payments
+// instead of a match — team-wide, not per-month, so there's no per-match
+// override to check first here. Nets-fee config only: this used to fall
+// back to the match default (paymentDefault) whenever no subscription QR
+// was set, which meant a player paying their monthly subscription could
+// see the match's QR. Now it just 404s until a nets-fee QR is actually
+// uploaded in Settings — the app's own effectiveSubQr (Subscription tab)
+// and the message builders in index.html all made the same change.
+async function handleSubQrImage(url, env) {
+  const team = url.searchParams.get("team");
+  if (!team) return new Response("Missing team", { status: 400 });
+
+  const serviceAccount = loadServiceAccount(env);
+  if (!serviceAccount) return new Response("Server misconfigured", { status: 500 });
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(serviceAccount, ["https://www.googleapis.com/auth/datastore"]);
+  } catch (e) {
+    return new Response("Auth failed: " + e.message, { status: 500 });
+  }
+
+  const projectId = serviceAccount.project_id;
+  let dataUrl = null;
+  const subRaw = await firestoreGetValue(projectId, accessToken, `${team}__subscriptionPaymentDefault`);
+  if (subRaw) {
+    try { dataUrl = JSON.parse(subRaw).qr || null; } catch { dataUrl = null; }
+  }
+
+  if (!dataUrl || !dataUrl.startsWith("data:")) {
+    return new Response("Not found", { status: 404 });
+  }
+
+  const parsed = dataUrl.match(/^data:([^;]+);base64,(.*)$/);
+  if (!parsed) return new Response("Bad image data", { status: 500 });
+  const mime = parsed[1];
+  const binary = atob(parsed[2]);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+
+  return new Response(bytes, {
+    headers: { "Content-Type": mime, "Cache-Control": "public, max-age=3600" },
+  });
+}
+
 // The actual link that goes in the WhatsApp message — /p/<token>, where
 // token is just base64url("team:matchId"). Everything else (amount, UPI
 // id, payee name) is looked up here rather than carried in the URL.
@@ -370,6 +419,104 @@ async function handlePayCard(url, env, token) {
     // A visible fallback button is above regardless — some mobile
     // browsers only allow a page to redirect after a real tap, so this
     // automatic attempt isn't guaranteed to fire on every device.
+    setTimeout(function () { window.location.href = ${JSON.stringify(upiLink)}; }, 300);
+  </script>` : ""}
+</body>
+</html>`;
+
+  return new Response(html, { headers: { "Content-Type": "text/html; charset=utf-8" } });
+}
+
+// Same job as handlePayCard above, for nets-fee/subscription payments.
+// token is base64url("team:monthKey") instead of "team:matchId" — a
+// subscription doesn't have a match to point at, just a team and which
+// month it's for. The amount comes from the team's rates.subAmount
+// (a fixed per-player figure) rather than being split across playedCount
+// the way a match's totalCost is, so there's no matches doc to read here.
+async function handleSubPayCard(url, env, token) {
+  let team = "";
+  let monthKeyStr = "";
+  try {
+    const decoded = base64UrlDecode(token);
+    const sep = decoded.indexOf(":");
+    if (sep === -1) throw new Error("bad token");
+    team = decoded.slice(0, sep);
+    monthKeyStr = decoded.slice(sep + 1);
+  } catch {
+    return new Response("Bad link", { status: 400 });
+  }
+  if (!team || !monthKeyStr) return new Response("Bad link", { status: 400 });
+
+  const serviceAccount = loadServiceAccount(env);
+  if (!serviceAccount) return new Response("Server misconfigured", { status: 500 });
+
+  let accessToken;
+  try {
+    accessToken = await getAccessToken(serviceAccount, ["https://www.googleapis.com/auth/datastore"]);
+  } catch (e) {
+    return new Response("Auth failed: " + e.message, { status: 500 });
+  }
+
+  const projectId = serviceAccount.project_id;
+  // Nets-fee config only — no paymentDefault (match) read here anymore, so
+  // there's nothing left to fall back to for the UPI id below either.
+  const [subRaw, ratesRaw, teamsIndexRaw] = await Promise.all([
+    firestoreGetValue(projectId, accessToken, `${team}__subscriptionPaymentDefault`),
+    firestoreGetValue(projectId, accessToken, `${team}__rates`),
+    firestoreGetValue(projectId, accessToken, "teamsIndex"),
+  ]);
+
+  let subDefault = {};
+  try { subDefault = subRaw ? JSON.parse(subRaw) : {}; } catch { subDefault = {}; }
+
+  let payeeName = "Pavilion";
+  try {
+    const teamsIndex = teamsIndexRaw ? JSON.parse(teamsIndexRaw) : {};
+    if (teamsIndex[team] && teamsIndex[team].teamName) payeeName = teamsIndex[team].teamName;
+  } catch {
+    // fall through with the default name
+  }
+
+  let subAmount = 1000; // same DEFAULT_RATES.subAmount fallback index.html itself uses
+  try {
+    const rates = ratesRaw ? JSON.parse(ratesRaw) : {};
+    if (rates.subAmount) subAmount = Number(rates.subAmount) || subAmount;
+  } catch {
+    // fall through with the default amount
+  }
+
+  const upiId = (subDefault.upiNumber || "").trim();
+
+  const imageUrl = `${url.origin}/qr-image-sub?team=${encodeURIComponent(team)}`;
+  const upiParams = new URLSearchParams();
+  if (upiId) upiParams.set("pa", upiId);
+  upiParams.set("pn", payeeName);
+  if (subAmount) upiParams.set("am", String(subAmount));
+  upiParams.set("cu", "INR");
+  const upiLink = upiId ? `upi://pay?${upiParams.toString()}` : "";
+  const title = `Pay ₹${subAmount} — Nets Subscription`;
+
+  const html = `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>${escapeHtml(title)}</title>
+<meta property="og:title" content="${escapeHtml(title)}">
+<meta property="og:description" content="Tap to pay via UPI">
+<meta property="og:image" content="${imageUrl}">
+<meta property="og:type" content="website">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #16301F; color: #F3EEDF; display: flex; flex-direction: column; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 24px; text-align: center; }
+  img { width: 160px; height: 160px; border-radius: 12px; background: #fff; margin-bottom: 20px; object-fit: contain; }
+  a.btn { background: #C08A45; color: #fff; text-decoration: none; padding: 12px 24px; border-radius: 8px; font-weight: 600; display: inline-block; margin-top: 16px; }
+</style>
+</head>
+<body>
+  <img src="${imageUrl}" alt="Payment QR" />
+  <div>${escapeHtml(title)}</div>
+  ${upiLink ? `<a class="btn" href="${upiLink}">Tap to pay</a>` : `<div style="margin-top:16px;color:#B7C4B8;font-size:13px;">Scan the QR above to pay</div>`}
+  ${upiLink ? `<script>
     setTimeout(function () { window.location.href = ${JSON.stringify(upiLink)}; }, 300);
   </script>` : ""}
 </body>
@@ -594,7 +741,9 @@ export default {
     try {
       const url = new URL(request.url);
       if (url.pathname === "/qr-image") return await handleQrImage(url, env);
+      if (url.pathname === "/qr-image-sub") return await handleSubQrImage(url, env);
       if (url.pathname.startsWith("/p/")) return await handlePayCard(url, env, url.pathname.slice(3));
+      if (url.pathname.startsWith("/sp/")) return await handleSubPayCard(url, env, url.pathname.slice(4));
       if (url.pathname === "/live/start") return await handleLiveStart(request, env);
       if (url.pathname === "/live/join") return await handleLiveJoin(request, env);
       if (url.pathname === "/live/end") return await handleLiveEnd(request, env);
