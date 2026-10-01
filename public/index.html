@@ -8169,7 +8169,14 @@ function PlayerHomeDashboard({ matches, days, authedPlayer, subs, monthPayments,
   );
 }
 function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailable, toggleMatchNotAvailable, setCarpoolRole, updateCarpoolOffer, updateCarpoolLocation, startSharingLiveLocation, stopSharingLiveLocation, joinCarpoolDriver, leaveCarpoolRide, cancelCarpoolEntry, photos, onViewPhoto, onViewClip, paymentDefault, uploadMatchProof, removeMatchProof, onMatchLiveStarted, onMatchLiveStopped, teamName }) {
-  const matchList = Object.values(matches || {}).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
+  const today = todayISO();
+  // Players only ever see what's ahead — a completed match (and whatever
+  // got voted/paid on it) stays visible to admin, but has nothing left for
+  // a player to do, so it drops off this list once its date passes. Same
+  // "upcoming" predicate MatchesAdminTab uses for its own Upcoming tab, so
+  // a match disappears from here at the same moment it would from there.
+  const allMatches = Object.values(matches || {});
+  const matchList = allMatches.filter((m) => !m.date || m.date >= today).sort((a, b) => (a.date || "").localeCompare(b.date || ""));
   const canPayInline = isMobileDevice();
   // One match expanded at a time — same mechanism MatchesAdminTab already
   // uses (expandedId), so this scales the same way as the roster grows.
@@ -8218,7 +8225,9 @@ function PlayerMatchesView({ matches, players, authedPlayer, toggleMatchAvailabl
     return (
       <div className="card-elevated" style={{ background: COLORS.card, border: `1px solid ${COLORS.line}`, borderRadius: 12, padding: 24, textAlign: "center" }}>
         <div style={{ fontSize: 28, marginBottom: 8 }}>🏏</div>
-        <div style={{ fontSize: 13, color: COLORS.inkSoft }}>No weekend matches scheduled right now.</div>
+        <div style={{ fontSize: 13, color: COLORS.inkSoft }}>
+          {allMatches.length === 0 ? "No weekend matches scheduled right now." : "No upcoming matches right now — check back once the next one's posted."}
+        </div>
       </div>
     );
   }
