@@ -47,6 +47,15 @@ service cloud.firestore {
                         )
                         ||
                         docId.matches('^[a-z0-9-]+__photo_.*$')
+                        ||
+                        // Archived matches — one document per match
+                        // (matchesArchive_<year>_<matchId>), plus the
+                        // legacy per-year bundle shape kept readable for
+                        // compatibility. This pattern was missing entirely
+                        // until now, which meant every write here was
+                        // rejected — see the conversation this fix came
+                        // from for what that cost.
+                        docId.matches('^[a-z0-9-]+__matchesArchive_[0-9]{4}(_.*)?$')
                       )
                    && request.resource.data.keys().hasAll(['value'])
                    && request.resource.data.value is string

@@ -5332,29 +5332,35 @@ function CricketNetsTracker() {
     // neither be marked paid nor show up in the Match dues card.
     const knownIds = new Set(players.map((p) => p.id));
     const toArchive = Object.values(matches).filter((m) => m.date && m.date < cutoff && matchUnpaidIds(m, knownIds).length === 0);
-    if (toArchive.length === 0) return { archived: 0, years: [] };
-    const byYear = {};
-    toArchive.forEach((m) => {
+    if (toArchive.length === 0) return { archived: 0, years: [], failed: 0 };
+    // One document per match (matchesArchive_<year>_<matchId>) instead of
+    // one document per year bundling every match for that year — the
+    // earlier shape could grow past Firestore's 500KB-per-field cap once
+    // enough matches accumulated, and when a write failed this function
+    // deleted the matches from the live list anyway without checking,
+    // which silently destroyed them (never saved anywhere, then removed
+    // from the one place they still existed). Each match's own document
+    // stays far under that cap regardless of how much history piles up,
+    // the same fix already applied to banners/QRs/photos for exactly this
+    // reason — and a result is now checked before anything live is
+    // touched, so a failed write just leaves that match live instead of
+    // losing it.
+    const succeeded = [];
+    for (const m of toArchive) {
       const year = m.date.slice(0, 4);
-      (byYear[year] = byYear[year] || []).push(m);
-    });
-    for (const [year, list] of Object.entries(byYear)) {
-      let existing = {};
-      try {
-        const res = await window.storage.get(`matchesArchive_${year}`);
-        if (res && res.value) existing = JSON.parse(res.value);
-      } catch (e) {
-        console.error("archiveOldMatches: failed to read archive", year, e);
-      }
-      list.forEach((m) => { existing[m.id] = m; });
-      await window.storage.set(`matchesArchive_${year}`, JSON.stringify(existing));
+      const res = await window.storage.set(`matchesArchive_${year}_${m.id}`, JSON.stringify(m));
+      if (res) succeeded.push(m);
+      else console.error("archiveOldMatches: failed to save match", m.id, "— leaving it in the live list");
     }
-    setMatches((prev) => {
-      const next = { ...prev };
-      toArchive.forEach((m) => delete next[m.id]);
-      return next;
-    });
-    return { archived: toArchive.length, years: Object.keys(byYear) };
+    if (succeeded.length > 0) {
+      setMatches((prev) => {
+        const next = { ...prev };
+        succeeded.forEach((m) => delete next[m.id]);
+        return next;
+      });
+    }
+    const years = Array.from(new Set(succeeded.map((m) => m.date.slice(0, 4))));
+    return { archived: succeeded.length, years, failed: toArchive.length - succeeded.length };
   }
 
   // posterId is null when the admin posts on the team's own behalf (e.g.
@@ -11172,19 +11178,42 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
     return filterByQuery(combined);
   })();
 
+  // One document per archived match now (see archiveOldMatches), found via
+  // a prefix list — same pattern loadAllPhotos already uses for photo_*.
+  // Also checks the old per-year bundle key, which stays readable for any
+  // year that happened to be written under the previous shape.
+  async function fetchArchiveYear(year) {
+    const data = {};
+    try {
+      const listRes = await window.storage.list(`matchesArchive_${year}_`);
+      if (listRes && listRes.keys && listRes.keys.length) {
+        const entries = await Promise.all(listRes.keys.map((key) => window.storage.get(key)));
+        entries.forEach((res) => {
+          if (!res || !res.value) return;
+          try { const m = JSON.parse(res.value); if (m && m.id) data[m.id] = m; } catch {}
+        });
+      }
+    } catch (e) {
+      console.error("Completed matches: failed to list archive year", year, e);
+    }
+    try {
+      const legacy = await window.storage.get(`matchesArchive_${year}`);
+      if (legacy && legacy.value) {
+        const parsed = JSON.parse(legacy.value);
+        Object.values(parsed || {}).forEach((m) => { if (m && m.id && !data[m.id]) data[m.id] = m; });
+      }
+    } catch (e) {
+      console.error("Completed matches: failed to read legacy archive year", year, e);
+    }
+    return data;
+  }
+
   async function runCompletedSearch() {
     if (pendingArchiveYears.length === 0) return;
     setArchiveFetching(true);
     const fetched = {};
     for (const y of pendingArchiveYears) {
-      let data = {};
-      try {
-        const res = await window.storage.get(`matchesArchive_${y}`);
-        if (res && res.value) data = JSON.parse(res.value);
-      } catch (e) {
-        console.error("Completed matches: failed to fetch archive year", y, e);
-      }
-      fetched[y] = data;
+      fetched[y] = await fetchArchiveYear(y);
     }
     setArchiveCache((prev) => ({ ...prev, ...fetched }));
     setArchiveFetching(false);
@@ -11415,6 +11444,11 @@ function MatchesAdminTab({ players, photos, onViewPhoto, matches, addMatch, upda
       {archiveDone && archiveDone.archived > 0 && (
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#3B6D11", background: "#EAF3E4", borderRadius: 8, padding: "7px 11px", marginBottom: 14 }}>
           <Icon size={12}>✓</Icon> Archived {archiveDone.archived} match{archiveDone.archived === 1 ? "" : "es"}. Find them under Completed.
+        </div>
+      )}
+      {archiveDone && archiveDone.failed > 0 && (
+        <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 11.5, color: "#9A3634", background: "#FCEBEA", borderRadius: 8, padding: "7px 11px", marginBottom: 14 }}>
+          <Icon size={12}>⚠</Icon> {archiveDone.failed} match{archiveDone.failed === 1 ? "" : "es"} couldn't be archived and stayed in the live list — nothing was lost, try again later.
         </div>
       )}
       {heldBackForDuesCount > 0 && (
