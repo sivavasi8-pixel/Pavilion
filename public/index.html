@@ -1311,6 +1311,13 @@ function fmtINR(n) {
   const v = Math.round((num + Number.EPSILON) * 100) / 100;
   return `₹${v.toLocaleString("en-IN")}`;
 }
+// fmtINR on a negative number reads "₹-2,612" — technically correct, easy
+// to misread as a typo. Used wherever a figure can legitimately go either
+// way (carried-forward balance, manual adjustment) so it reads "-₹2,612".
+function fmtSignedINR(n) {
+  const num = Number(n) || 0;
+  return num < 0 ? `-${fmtINR(Math.abs(num))}` : fmtINR(num);
+}
 // Month+day only, deliberately ignoring the year — a birthday "matches"
 // every year it comes around, and nothing player-facing should reveal age.
 function isBirthdayToday(dob) {
@@ -3244,8 +3251,13 @@ function runningCarryFor(activeMonthStr, subs, days, payments, rates, adjustment
   months.forEach((m) => {
     const t = computeMonthTotals(m, subs, days, payments, resolveMonthRates(m, rates, lockedMonths));
     const adj = Number(adjustments[m] || 0);
-    const closing = t.balance + carry + adj;
-    carry = closing > 0 ? closing : 0;
+    // Deliberately not clamped to zero — a month that closes short carries
+    // that shortfall into the next one as a real (negative) due, the same
+    // way a surplus already carries forward as a positive one. Clamping a
+    // negative closing to 0 here used to silently write off any shortfall
+    // that didn't get collected before the month ended, with nothing left
+    // anywhere to show it had ever existed.
+    carry = t.balance + carry + adj;
   });
   return carry;
 }
@@ -3262,7 +3274,9 @@ function buildFullSeasonCSV(subs, days, payments, rates, adjustments, lockedMont
     const closing = t.balance + carry + adj;
     const locked = !!(lockedMonths && lockedMonths[m]);
     lines.push([monthLabel(m), t.hours, t.balls, t.netFee, t.ballFee, t.expense, t.subscribedCount, t.expected, t.collected, t.pending, carry, adj, closing, locked ? "Yes" : "No"].join(","));
-    carry = closing > 0 ? closing : 0;
+    // See runningCarryFor's comment — a shortfall carries forward as a
+    // negative CarryIn next row instead of being clamped away.
+    carry = closing;
   });
   lines.push("");
   lines.push("DAILY LOG");
@@ -9773,16 +9787,22 @@ function SummaryTab({
   const [fullExported, setFullExported] = useState(false);
   const [confirmingUnlock, setConfirmingUnlock] = useState(false);
 
+  // Ordered so the shortfall/surplus arithmetic reads top to bottom as one
+  // chain — expense, what's expected from subs, this month's own balance,
+  // then what carried in and what was manually adjusted — landing right
+  // above the big Shortfall/Balance card below, instead of leaving the
+  // reader to go find "Expected" further down and subtract it themselves.
   const rows = [
     ["Net hours used", `${totals.hours} hr`],
     [`Net fee (₹${rates.netRate}/hr)`, fmtINR(totals.netFee)],
     ["New balls used", `${totals.balls}`],
     [`Ball fee (₹${rates.ballRate}/ball)`, fmtINR(totals.ballFee)],
     ["Total expense", fmtINR(totals.expense)],
-    ["Carried forward in", fmtINR(carryForward)],
-    ["Manual adjustment", fmtINR(monthAdjustment)],
     ["Subscribed players", `${monthSubPlayers.length}`],
     [`Expected (₹${rates.subAmount} × players)`, fmtINR(totals.expected)],
+    ["This month's balance (expected − expense)", fmtSignedINR(totals.balance)],
+    ["Carried forward in", fmtSignedINR(carryForward)],
+    ["Manual adjustment", fmtSignedINR(monthAdjustment)],
     ["Actually collected", fmtINR(totals.collected)],
     ["Pending dues", fmtINR(Math.max(totals.pending, 0))],
   ];
@@ -9844,12 +9864,21 @@ function SummaryTab({
     if (totals.pending > 0) subsLine += `, ${fmtINR(Math.max(totals.pending, 0))} still pending`;
     out.push(subsLine + ".");
     // Carry-in/manual adjustment are usually zero — only worth a line when
-    // one of them actually moved the numbers this month.
+    // one of them actually moved the numbers this month. Spelled out as a
+    // small breakdown (this month's own balance, then what carried in,
+    // then any adjustment) rather than a single parenthetical, so the
+    // closing Shortfall/Surplus line below is never just an unexplained
+    // number — especially now that a carried balance can be a debt
+    // (negative) as well as a surplus.
     if (carryForward !== 0 || monthAdjustment !== 0) {
-      const extras = [];
-      if (carryForward !== 0) extras.push(`${fmtINR(carryForward)} carried forward from last month`);
-      if (monthAdjustment !== 0) extras.push(`a ${fmtINR(monthAdjustment)} manual adjustment`);
-      out.push(`(Also includes ${extras.join(" and ")}.)`);
+      out.push("");
+      out.push(`This month: ${fmtSignedINR(totals.balance)}`);
+      if (carryForward !== 0) {
+        out.push(carryForward > 0
+          ? `Carried forward: ${fmtSignedINR(carryForward)} (surplus from last month)`
+          : `Carried forward: ${fmtSignedINR(carryForward)} (unpaid dues from last month)`);
+      }
+      if (monthAdjustment !== 0) out.push(`Adjustment: ${fmtSignedINR(monthAdjustment)}`);
     }
     out.push("—————————————");
     // Names the actual next month rather than just saying "next month" —
@@ -9859,7 +9888,7 @@ function SummaryTab({
     // explicit month name tying them together.
     const upcoming = monthLabel(nextMonthKey(activeMonth));
     if (closingBalance < 0) {
-      out.push(`⚠️ *We're short by ${fmtINR(Math.abs(closingBalance))}* — covering it would take an extra ${fmtINR(perPlayerExtra)} from each of the ${monthSubPlayers.length} subscribed players. This won't carry into ${upcoming} as debt — it needs to be resolved now.`);
+      out.push(`⚠️ *We're short by ${fmtINR(Math.abs(closingBalance))}* — covering it would take an extra ${fmtINR(perPlayerExtra)} from each of the ${monthSubPlayers.length} subscribed players. If this isn't cleared, it carries forward into ${upcoming}.`);
     } else if (closingBalance > 0) {
       out.push(`✅ *We're in surplus: ${fmtINR(closingBalance)}* — this will carry forward to ${upcoming}.`);
     } else {
@@ -10449,7 +10478,7 @@ function SettingsTab({ rates, setRateField, paymentDefault, setPaymentDefaultFie
 }
 
 const MATCH_TYPE_OPTIONS = ["League Match", "Semi Final", "Final", "Practice Match"];
-const OVERS_OPTIONS = ["10", "15", "20", "30", "50"];
+const OVERS_OPTIONS = ["10", "15", "20", "25", "30", "50"];
 const BALL_TYPE_OPTIONS = ["Leather Red", "Leather White"];
 const JERSEY_OPTIONS = ["Whites", "Color"];
 const SEAT_COUNT_OPTIONS = ["1", "2", "3", "4", "5", "6", "7", "8"];
